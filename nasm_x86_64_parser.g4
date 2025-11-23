@@ -569,7 +569,9 @@ opcode
     : MOV | LEA
     | PUSH | POP                    // Stack operations
     | ADD | SUB | INC | DEC         // Arithmetic
-    | CMP | TEST                    // Comparison
+    | MOVSS | ADDSS | MULSS         // Floating-Point Arithmetic (SSE)
+    | CVTTSS2SI                     // Floating-Point to Integer Conversion (SSE)
+    | CMP | TEST | SETNE | SETC     // Comparison
     | AND | OR | XOR                // Logical
     | SHL | SHR | SAR               // Bit shifts
     | CALL | JMP | RET              // Control flow (if not in terminator_instruction)
@@ -584,7 +586,6 @@ opcode
     | NOT                           // Bitwise NOT
     | ROL | ROR                     // Rotate
     | BT | BTS | BTR | BTC          // Bit test and set
-    | MOVS | STOS | LODS            // String ops (with REP prefix)
     | LEA                           // RIP-relative addressing
     | UD2                           // Undefined instruction (for deliberate faults)
     ;
@@ -626,6 +627,8 @@ register
     | R13 | R13D | R13W | R13B
     | R14 | R14D | R14W | R14B
     | R15 | R15D | R15W | R15B
+    | XMM0 | XMM1 | XMM2 | XMM3 | XMM4 | XMM5 | XMM6 | XMM7
+    | XMM8 | XMM9 | XMM10 | XMM11 | XMM12 | XMM13 | XMM14 | XMM15
     ;
 
 strict
