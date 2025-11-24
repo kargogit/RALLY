@@ -1,11 +1,26 @@
-from typing import Any, Dict, List, Optional, Union, Callable
+from typing import Any, Dict, List, Optional, Union, Callable, Protocol
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from collections import defaultdict
 import json
+import sys
 
 # ============================================================================
-# Node Classes - Better type safety and structure
+# ASTVisitor Protocol
+# ============================================================================
+
+class ASTVisitor(Protocol):
+    """Protocol defining explicit visit methods for AST nodes"""
+    def visit_program(self, node: Any, context: Any) -> Any: ...
+    def visit_section(self, node: Any, context: Any) -> Any: ...
+    def visit_block(self, node: Any, context: Any) -> Any: ...
+    def visit_instruction(self, node: Any, context: Any) -> Any: ...
+    def visit_operand(self, node: Any, context: Any) -> Any: ...
+    def visit_label(self, node: Any, context: Any) -> Any: ...
+    def generic_visit(self, node: Any, context: Any) -> Any: ...
+
+# ============================================================================
+# AST Node Definitions (Hierarchical & Machine-Independent)
 # ============================================================================
 
 @dataclass
@@ -14,7 +29,55 @@ class ASTNode:
     pass
 
 @dataclass
-class Integer(ASTNode):
+class Program(ASTNode):
+    """Root program node"""
+    sections: List['Section'] = field(default_factory=list)
+
+@dataclass
+class Section(ASTNode):
+    """Encapsulates code sections (e.g., .text, .data)"""
+    name: str
+    blocks: List['BasicBlock'] = field(default_factory=list)
+    pseudo_instruct: List[Dict[str, Any]] = field(default_factory=list)
+
+@dataclass
+class BasicBlock(ASTNode):
+    """A logical block of instructions and labels"""
+    instructions: List[Union['Instruction', 'Label']] = field(default_factory=list)
+
+@dataclass
+class Instruction(ASTNode):
+    """Captures opcodes and operands"""
+    opcode: str
+    operands: List['Operand'] = field(default_factory=list)
+    prefix: Optional[str] = None
+
+@dataclass
+class Label(ASTNode):
+    """Represents symbolic identifiers"""
+    name: str
+
+@dataclass
+class Operand(ASTNode):
+    """Generic operand container"""
+    register: Optional[str] = None
+    memory: Optional['Memory'] = None
+    immediate: Optional['Immediate'] = None
+    expression: Optional['Expression'] = None
+    size: Optional[str] = None
+    name: Optional[str] = None
+
+@dataclass
+class Memory(ASTNode):
+    """Specialized Memory operand (including RIP-relative)"""
+    base: Optional[str] = None
+    index: Optional[str] = None
+    scale: Optional[int] = None
+    displacement: Optional[Union[int, str]] = None
+
+@dataclass
+class Immediate(ASTNode):
+    """Specialized Immediate operand"""
     value: Union[int, str]
     type: str
 
@@ -28,87 +91,37 @@ class Name(ASTNode):
 
 @dataclass
 class Expression(ASTNode):
-    type: str  # 'additive', 'multiplicative', 'unary', etc.
+    type: str
     operands: List[ASTNode] = field(default_factory=list)
     operator: Optional[str] = None
 
-@dataclass
-class Operand(ASTNode):
-    register: Optional[str] = None
-    size: Optional[str] = None
-    expression: Optional[Expression] = None
-    integer: Optional[Integer] = None
-    name: Optional[str] = None
-
-@dataclass
-class Instruction(ASTNode):
-    opcode: str
-    operands: List[Operand] = field(default_factory=list)
-    prefix: Optional[str] = None
-
-@dataclass
-class Label(ASTNode):
-    name: str
-
-@dataclass
-class Section(ASTNode):
-    name: str
-    blocks: List[List[ASTNode]] = field(default_factory=list)
-    pseudo_instruct: List[Dict[str, Any]] = field(default_factory=list)
-
 # ============================================================================
-# Helper Functions - Extraction utilities
+# Helper Functions
 # ============================================================================
 
 class ParseTreeNavigator:
     """Utilities for navigating the parse tree"""
 
     @staticmethod
-    def get_nested(data: Any, *keys: str, default=None) -> Any:
-        """Safely get nested dictionary/list values"""
-        current = data
-        for key in keys:
-            if isinstance(current, dict):
-                current = current.get(key, default)
-            elif isinstance(current, list) and key.isdigit():
-                idx = int(key)
-                current = current[idx] if 0 <= idx < len(current) else default
-            elif isinstance(current, list) and len(current) > 0:
-                # Try to find key in first element if it's a dict
-                if isinstance(current[0], dict):
-                    current = current[0].get(key, default)
-                else:
-                    return default
-            else:
-                return default
-            if current is None:
-                return default
-        return current
-
-    @staticmethod
     def normalize_token(token: Any) -> str:
         """Extract string value from various token formats"""
         if isinstance(token, str):
             return token
-
         if isinstance(token, (tuple, list)) and len(token) >= 2:
             if isinstance(token[0], str):
                 return str(token[0])
             if isinstance(token[1], list) and token[1]:
                 return str(token[1][0])
-
         if isinstance(token, list) and len(token) == 1:
             return ParseTreeNavigator.normalize_token(token[0])
-
         if isinstance(token, dict):
-            for key in ("name", "register", "size", "opcode", "dx"):
+            for key in ("name", "register", "size", "opcode", "dx", "terminator_opcode"):
                 if key in token and token[key]:
                     return ParseTreeNavigator.normalize_token(token[key])
-
         return ""
 
 # ============================================================================
-# Visitor Pattern - Clean separation of traversal and transformation
+# Visitor Pattern Base
 # ============================================================================
 
 class ParseTreeVisitor(ABC):
@@ -121,309 +134,150 @@ class ParseTreeVisitor(ABC):
         """Dispatch to appropriate visit method based on node type"""
         if not isinstance(node, dict):
             return None
-
         context = context or {}
 
-        # Find the first key that matches a visit method
+        # First matching key dispatch strategy
         for key in node.keys():
             method_name = f"visit_{key}"
-            method = getattr(self, method_name, None)
-            if method:
-                return method(node[key], context)
-            else:
-                raise ValueError("Should be handled")
+            if hasattr(self, method_name):
+                return getattr(self, method_name)(node[key], context)
 
         return self.generic_visit(node, context)
 
     def generic_visit(self, node: Any, context: Dict[str, Any]) -> Any:
-        """Called when no specific visit method exists"""
         return node
 
 # ============================================================================
-# Transformation Registry - For extensibility
+# Transformation Registry
 # ============================================================================
 
 class TransformationRegistry:
-    """Registry pattern for registering transformation handlers"""
-
+    """Registry for granular node transformations"""
     def __init__(self):
         self._handlers: Dict[str, Callable] = {}
 
     def register(self, node_type: str):
-        """Decorator to register a handler for a node type"""
         def decorator(func: Callable):
             self._handlers[node_type] = func
             return func
         return decorator
 
-    def get_handler(self, node_type: str) -> Optional[Callable]:
-        """Get handler for a node type"""
-        return self._handlers.get(node_type)
-
-    def transform(self, node_type: str, data: Any, context: Dict[str, Any] = None) -> Any:
-        """Transform data using registered handler"""
-        handler = self.get_handler(node_type)
-        if handler:
-            return handler(data, context or {})
-        else:
-            raise ValueError("Should be handled")
-
-        return None
+    def transform(self, node_type: str, data: Any) -> Any:
+        handler = self._handlers.get(node_type)
+        return handler(data, {}) if handler else None
 
 # ============================================================================
 # Concrete Visitor Implementation
 # ============================================================================
 
 class AsmTransformer(ParseTreeVisitor):
-    """Transforms ANTLR parse tree to simplified AST"""
+    """
+    Concrete visitor that traverses the ANTLR parse tree and builds
+    a hierarchical, machine-independent AST.
+    """
 
     def __init__(self):
         super().__init__()
         self.registry = TransformationRegistry()
         self._setup_handlers()
-        self.text_section = None
+        # Initialize default .text section
+        self.text_section = Section(name=".text")
 
     def _setup_handlers(self):
-        """Register all transformation handlers"""
-
         @self.registry.register("integer")
         def handle_integer(data, ctx):
             if isinstance(data, list) and len(data) > 0:
                 int_data = data[0]
                 if isinstance(int_data, (list, tuple)) and len(int_data) == 2:
-                    return Integer(value=int_data[0], type=int_data[1])
-                else:
-                    raise ValueError("Should be handled")
-            else:
-                raise ValueError("Should be handled")
-
+                    return Immediate(value=int_data[0], type=int_data[1])
             return None
 
-        @self.registry.register("register")
-        def handle_register(data, ctx):
-            name = self.navigator.normalize_token(data)
-            return Register(name=name.upper())
+    # ============================================================================
+    # Specialized Visitors (Concrete Delegation)
+    # ============================================================================
 
-        @self.registry.register("name")
-        def handle_name(data, ctx):
-            value = self.navigator.normalize_token(data)
-            return Name(value=value)
-
-    def visit_program(self, program_data: List[Any], context: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Transform top-level program"""
+    def visit_program(self, program_data: List[Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """Entry point: Transforms Program -> Sections"""
         output = []
 
-        # Initialize sections
-        text_section = Section(
-            name = ".text"
-        )
+        # Default section structure
+        text_section_dict = self._section_to_dict(self.text_section)
         global_store = {"globals": []}
 
-        self.text_section = {"section": self._section_to_dict(text_section)}
-        output.append(self.text_section)
+        # We keep a reference to the current dict we are appending to
+        output.append({"section": text_section_dict})
         output.append(global_store)
 
-        current_section = output[0]
-        context["current_section"] = current_section
+        context["current_section_dict"] = output[0]
 
         for node in program_data:
             if not isinstance(node, dict):
                 continue
 
+            # Dispatch to specific line/block handlers
             result = self.visit(node, context)
+
             if result:
-                if isinstance(result, dict):
-                    if "section" in result:
-                        if result["section"]["name"] == ".text":
-                            pass
-                        else:
-                            output.append(result)
-                        context["current_section"] = result
-
-                    elif "global" in result:
-                        global_store["globals"].append(result["global"])
-
-                    elif "block" in result:
-                        context["current_section"]["section"]["blocks"].append(result)
-
-                    elif "pseudo_instruct" in result:
-                        context["current_section"]["section"]["pseudo_instruct"].append(result["pseudo_instruct"])
-
+                if "section" in result:
+                    # New section found
+                    if result["section"]["name"] == ".text":
+                        pass # Already initialized
                     else:
-                        raise ValueError("Should be handled")
+                        output.append(result)
+                    context["current_section_dict"] = result
+                elif "global" in result:
+                    global_store["globals"].append(result["global"])
+                elif "block" in result:
+                    context["current_section_dict"]["section"]["blocks"].append(result)
+                elif "pseudo_instruct" in result:
+                    context["current_section_dict"]["section"]["pseudo_instruct"].append(result["pseudo_instruct"])
 
-                else:
-                    raise ValueError("Should be handled")
-            else:
-                raise ValueError("Should be handled")
-
-        return output
+        return {"program": output}
 
     def visit_line(self, line_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Process a line (directive or instruction)"""
+        """Process a line (Delegates to Directive or Instruction)"""
         if not line_data or not isinstance(line_data[0], dict):
             return None
 
         line_content = line_data[0]
-
         if "directive" in line_content:
             return self._process_directive(line_content["directive"], context)
         elif "pseudoinstruction" in line_content:
             return self._process_pseudoinstruction(line_content["pseudoinstruction"], context)
-        else:
-            raise ValueError("Should be handled")
-
         return None
 
     def visit_block(self, block_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Process a block of instructions"""
-        block_output = []
+        """Process a Basic Block of instructions/labels"""
+        block_nodes = []
 
         for item in block_data:
             if not isinstance(item, dict):
                 continue
 
             if "label" in item:
-                label_node = self._process_label(item["label"])
+                label_node = self.visit_label(item["label"], context)
                 if label_node:
-                    block_output.append(label_node)
-
+                    block_nodes.append(label_node)
             elif "non_terminator_line" in item or "terminator_line" in item:
-                instr_node = self._process_instruction_line(item, context)
-                if instr_node:
-                    block_output.append(instr_node)
-                else:
-                    raise ValueError("Should be handled")
+                # Extract instruction data from line wrapper
+                line_node = item.get("non_terminator_line") or item.get("terminator_line")
+                instr_data = line_node[0].get("instruction") or line_node[0].get("terminator_instruction")
+                if instr_data:
+                    instr_node = self.visit_instruction(instr_data, context)
+                    if instr_node:
+                        block_nodes.append(instr_node)
 
-            else:
-                raise ValueError("Should be handled")
+        return {"block": block_nodes} if block_nodes else None
 
-        if block_output:
-            return { "block": block_output }
-        else:
-            raise ValueError("Should be handled")
-
-
-    def _process_directive(self, directive_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Process directive (section, global, etc.)"""
-        if not directive_data or len(directive_data) < 2:
-            return None
-
-        directive_type = directive_data[0]
-        directive_params = directive_data[1] if len(directive_data) > 1 else {}
-
-        # Section directive
-        if "section" in directive_type:
-            name = self._extract_section_name(directive_data)
-            if name == ".text":
-                return self.text_section
-            else:
-                return {
-                    "section": {
-                        "name": name,
-                        "blocks": [],
-                        "pseudo_instruct": []
-                    }
-                }
-
-        # Global directive
-        elif "global" in directive_type:
-            name = self._extract_global_name(directive_data)
-            return {"global": name}
-
-        else:
-            raise ValueError("Should be handled")
-
-        return None
-
-    def _process_pseudoinstruction(self, pseudo_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Process pseudo-instruction"""
-        pseudo_dict = {}
-        pseudo_values = []
-
-        for item in pseudo_data:
-            if not isinstance(item, dict):
-                continue
-
-            if "name" in item:
-                pseudo_dict["name"] = self.navigator.normalize_token(item["name"])
-            elif "dx" in item:
-                pseudo_dict["dx"] = self.navigator.normalize_token(item["dx"])
-            elif "resx" in item:
-                pseudo_dict["resx"] = self.navigator.normalize_token(item["resx"])
-            elif "value" in item:
-                value = self._process_pseudo_value(item["value"])
-                if value:
-                    pseudo_values.append(value)
-            elif "integer" in item:
-                int_node = self.registry.transform("integer", item["integer"])
-                if int_node:
-                    pseudo_dict["integer"] = {"type": int_node.type, "value": int_node.value}
-                else:
-                    raise ValueError("Should be handled")
-
-        if pseudo_values:
-            pseudo_dict["values"] = pseudo_values
-
-        if pseudo_dict:
-            return {"pseudo_instruct" : pseudo_dict}
-        else:
-            raise ValueError("Should be handled")
-
-    def _process_pseudo_value(self, value_data: List[Any]) -> Optional[Dict[str, Any]]:
-        """Process pseudo-instruction value"""
-        if not value_data or not isinstance(value_data[0], dict):
-            return None
-
-        atom = value_data[0].get("atom", [{}])[0]
-
-        if "integer" in atom:
-            int_node = self.registry.transform("integer", atom["integer"])
-            if int_node:
-                return {"integer": {"type": int_node.type, "value": int_node.value}}
-            else:
-                raise ValueError("Should be handled")
-
-        elif "float_number" in atom:
-            float_data = atom["float_number"][0]
-            if float_data and len(float_data) >= 2:
-                return {"float": {"type": float_data[1], "value": float_data[0]}}
-            else:
-                raise ValueError("Should be handled")
-
-        elif "string" in atom:
-            str_data = atom["string"][0]
-            if str_data:
-                return {"string": str_data[0]}
-            else:
-                raise ValueError("Should be handled")
-
-        elif "expression" in atom:
-            return self._process_expression(atom)
-
-        else:
-            raise ValueError("Should be handled")
-
-        return None
-
-    def _process_label(self, label_data: List[Any]) -> Optional[Dict[str, Any]]:
-        """Process label"""
+    def visit_label(self, label_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Explicit visitor for Label nodes"""
         if not label_data or not isinstance(label_data[0], dict):
             return None
-
         name = self.navigator.normalize_token(label_data[0].get("name"))
         return {"label": name}
 
-    def _process_instruction_line(self, line_item: Dict[str, Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Process instruction line"""
-        line_node = line_item.get("non_terminator_line") or line_item.get("terminator_line")
-        if not line_node or not isinstance(line_node[0], dict):
-            return None
-
-        instr_data = line_node[0].get("instruction") or line_node[0].get("terminator_instruction")
-        if not instr_data:
-            return None
-
+    def visit_instruction(self, instr_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Explicit visitor for Instruction nodes"""
         instruction = Instruction(opcode="")
 
         for piece in instr_data:
@@ -436,73 +290,189 @@ class AsmTransformer(ParseTreeVisitor):
                 opcode_key = "opcode" if "opcode" in piece else "terminator_opcode"
                 instruction.opcode = self.navigator.normalize_token(piece[opcode_key]).upper()
             elif "operand" in piece:
-                operand = self._process_operand(piece["operand"])
+                operand = self.visit_operand(piece["operand"], context)
                 instruction.operands.append(operand)
-            else:
-                raise ValueError("Should be handled")
 
         return {"instruction": self._instruction_to_dict(instruction)}
 
-    def _process_operand(self, operand_data: List[Any]) -> Dict[str, Any]:
-        """Process instruction operand"""
-        operand = {}
+    def visit_operand(self, operand_data: List[Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """Explicit visitor for Operand nodes"""
+        operand_dict = {}
 
+        # 1. Detect RIP-Relative addressing for position independence
+        rip_memory = self._detect_rip_relative(operand_data)
+        if rip_memory:
+            operand_dict["memory"] = {
+                "base": rip_memory.base,
+                "displacement": rip_memory.displacement
+            }
+            return operand_dict
+
+        # 2. Standard processing
         for item in operand_data:
             if not isinstance(item, dict):
                 continue
 
             if "register" in item:
-                operand["register"] = self.navigator.normalize_token(item["register"]).upper()
+                operand_dict["register"] = self.navigator.normalize_token(item["register"]).upper()
             elif "size" in item:
-                operand["size"] = self.navigator.normalize_token(item["size"]).upper()
+                operand_dict["size"] = self.navigator.normalize_token(item["size"]).upper()
             elif "expression" in item:
-                operand["expression"] = self._process_expression(item)
+                operand_dict["expression"] = self._process_expression(item)
             elif "integer" in item:
-                int_node = self.registry.transform("integer", item["integer"])
-                if int_node:
-                    operand["integer"] = {"value": int_node.value, "type": int_node.type}
-                else:
-                    raise ValueError("Should be handled")
+                imm_node = self.registry.transform("integer", item["integer"])
+                if imm_node:
+                    operand_dict["integer"] = {"value": imm_node.value, "type": imm_node.type}
             elif "name" in item:
-                operand["name"] = self.navigator.normalize_token(item["name"])
-            else:
-                raise ValueError("Should be handled")
+                operand_dict["name"] = self.navigator.normalize_token(item["name"])
 
-        return operand
+        return operand_dict
+
+    # ============================================================================
+    # RIP-Relative & Semantic Extraction Logic
+    # ============================================================================
+
+    def _detect_rip_relative(self, operand_data: Any) -> Optional[Memory]:
+        """Detects RIP-relative addressing in operand expressions."""
+        if not operand_data:
+            return None
+
+        # Simple heuristic: check string representation for rip/rel keyword
+        op_str = str(operand_data).lower()
+        if 'rip' in op_str or 'rel' in op_str:
+            return Memory(
+                base="RIP",
+                displacement=self._extract_rip_displacement(operand_data)
+            )
+        return None
+
+    def _extract_rip_displacement(self, operand_data: Any) -> Optional[Union[int, str]]:
+        """Extracts the symbolic displacement (e.g., 'stderr' from [rel stderr])"""
+        if isinstance(operand_data, list):
+            for item in operand_data:
+                if isinstance(item, dict) and 'expression' in item:
+                    expr = item['expression']
+                    # Dive into additive expression to find the label
+                    if isinstance(expr, list) and len(expr) > 0:
+                        return self._extract_from_expression(expr[0])
+        return None
+
+    def _extract_from_expression(self, expr_data: Any) -> Optional[Union[int, str]]:
+        """Recursively looks for the displacement identifier"""
+        if not isinstance(expr_data, dict):
+            return None
+
+        # Check for additive expression structure
+        if 'additiveExpression' in expr_data:
+            add_expr = expr_data['additiveExpression']
+            # Usually the second part of [rel + Label]
+            if len(add_expr) > 1:
+                for part in add_expr:
+                    if isinstance(part, dict):
+                        # Try to find name/label
+                        res = self._extract_from_expression(part)
+                        if res: return res
+
+        # Check basic atoms
+        if 'multiplicativeExpression' in expr_data:
+            return self._extract_from_expression(expr_data['multiplicativeExpression'][0])
+        if 'castExpression' in expr_data:
+             return self._extract_from_expression(expr_data['castExpression'][0])
+        if 'unaryExpression' in expr_data:
+             return self._extract_from_expression(expr_data['unaryExpression'][1])
+
+        # Base cases
+        if 'name' in expr_data:
+            return self.navigator.normalize_token(expr_data['name'])
+        if 'integer' in expr_data:
+             val = self.registry.transform("integer", expr_data['integer'])
+             return val.value if val else None
+
+        return None
+
+    # ============================================================================
+    # Helper Processors (Directives, Pseudo, Expressions)
+    # ============================================================================
+
+    def _process_directive(self, directive_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not directive_data or len(directive_data) < 2:
+            return None
+
+        directive_type = directive_data[0]
+
+        if "section" in directive_type:
+            name = self._extract_section_name(directive_data)
+            if name == ".text":
+                return {"section": self._section_to_dict(self.text_section)}
+            else:
+                # Create new section node
+                new_sect = Section(name=name)
+                return {"section": self._section_to_dict(new_sect)}
+
+        elif "global" in directive_type:
+            name = self._extract_global_name(directive_data)
+            return {"global": name}
+
+        return None
+
+    def _process_pseudoinstruction(self, pseudo_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        pseudo_dict = {}
+        pseudo_values = []
+
+        for item in pseudo_data:
+            if not isinstance(item, dict): continue
+
+            if "name" in item:
+                pseudo_dict["name"] = self.navigator.normalize_token(item["name"])
+            elif "dx" in item:
+                pseudo_dict["dx"] = self.navigator.normalize_token(item["dx"])
+            elif "resx" in item:
+                pseudo_dict["resx"] = self.navigator.normalize_token(item["resx"])
+            elif "value" in item:
+                val = self._process_pseudo_value(item["value"])
+                if val: pseudo_values.append(val)
+            elif "integer" in item:
+                imm = self.registry.transform("integer", item["integer"])
+                if imm: pseudo_dict["integer"] = {"type": imm.type, "value": imm.value}
+
+        if pseudo_values: pseudo_dict["values"] = pseudo_values
+        return {"pseudo_instruct": pseudo_dict} if pseudo_dict else None
+
+    def _process_pseudo_value(self, value_data: List[Any]) -> Optional[Dict[str, Any]]:
+        if not value_data or not isinstance(value_data[0], dict): return None
+        atom = value_data[0].get("atom", [{}])[0]
+
+        if "integer" in atom:
+            imm = self.registry.transform("integer", atom["integer"])
+            return {"integer": {"type": imm.type, "value": imm.value}} if imm else None
+        elif "float_number" in atom:
+            float_data = atom["float_number"][0]
+            if float_data and len(float_data) >= 2:
+                return {"float": {"type": float_data[1], "value": float_data[0]}}
+        elif "string" in atom:
+            return {"string": atom["string"][0][0]} if atom["string"] else None
+        elif "expression" in atom:
+            return self._process_expression(atom)
+        return None
 
     def _process_expression(self, expr_container: Dict[str, Any]) -> Any:
-        """Process expression - simplified version"""
-        # This would benefit from its own visitor class
-        expr_visitor = ExpressionVisitor(self.navigator)
-        return expr_visitor.process(expr_container)
+        visitor = ExpressionVisitor(self.navigator)
+        return visitor.process(expr_container)
 
-    # Helper methods
+    # Data Extraction Helpers
     def _extract_section_name(self, directive_data: List[Any]) -> str:
-        """Extract section name from directive"""
-        if len(directive_data) > 1:
-            params = directive_data[1].get("section_params", [])
-            if params and isinstance(params[0], dict):
-                return self.navigator.normalize_token(params[0].get("name"))
-            else:
-                raise ValueError("Should be handled")
-        else:
-            raise ValueError("Should be handled")
+        params = directive_data[1].get("section_params", [])
+        if params and isinstance(params[0], dict):
+            return self.navigator.normalize_token(params[0].get("name"))
         return ""
 
     def _extract_global_name(self, directive_data: List[Any]) -> str:
-        """Extract global name from directive"""
-        if len(directive_data) > 1:
-            params = directive_data[1].get("global_params", [])
-            if params and isinstance(params[0], dict):
-                return self.navigator.normalize_token(params[0].get("name"))
-            else:
-                raise ValueError("Should be handled")
-        else:
-            raise ValueError("Should be handled")
+        params = directive_data[1].get("global_params", [])
+        if params and isinstance(params[0], dict):
+            return self.navigator.normalize_token(params[0].get("name"))
         return ""
 
     def _section_to_dict(self, section: Section) -> Dict[str, Any]:
-        """Convert Section object to dict"""
         return {
             "name": section.name,
             "blocks": section.blocks,
@@ -510,180 +480,91 @@ class AsmTransformer(ParseTreeVisitor):
         }
 
     def _instruction_to_dict(self, instruction: Instruction) -> Dict[str, Any]:
-        """Convert Instruction object to dict"""
         result = {"opcode": instruction.opcode}
-        if instruction.prefix:
-            result["prefix"] = instruction.prefix
-        if instruction.operands:
-            result["operands"] = instruction.operands
+        if instruction.prefix: result["prefix"] = instruction.prefix
+        if instruction.operands: result["operands"] = instruction.operands
         return result
 
 # ============================================================================
-# Specialized Expression Visitor
+# Expression Visitor (Complex Operand Logic)
 # ============================================================================
 
 class ExpressionVisitor:
-    """Dedicated visitor for expression processing"""
-
     def __init__(self, navigator: ParseTreeNavigator):
         self.navigator = navigator
 
     def process(self, expr_container: Dict[str, Any]) -> Any:
-        """Process an expression container"""
-        if "expression" not in expr_container:
-            return None
-
+        if "expression" not in expr_container: return None
         expr_list = expr_container["expression"]
-        if not expr_list or not isinstance(expr_list[0], dict):
-            return None
+        if not expr_list or not isinstance(expr_list[0], dict): return None
 
         actual_expr = expr_list[0]
-
-        # Dispatch to specific handler
         if "castExpression" in actual_expr:
-            return self._process_cast_expression(actual_expr["castExpression"])
+            return self._visit_cast(actual_expr["castExpression"])
         elif "additiveExpression" in actual_expr:
-            return self._process_additive_expression(actual_expr["additiveExpression"])
+            return self._visit_additive(actual_expr["additiveExpression"])
         elif "multiplicativeExpression" in actual_expr:
-            return self._process_multiplicative_expression(actual_expr["multiplicativeExpression"])
-        else:
-            raise ValueError("Should be handled")
-
+            return self._visit_multiplicative(actual_expr["multiplicativeExpression"])
         return None
 
-    def _process_cast_expression(self, cast_expr: List[Any]) -> Any:
-        """Process cast expression"""
-        if not cast_expr or not isinstance(cast_expr[0], dict):
-            return None
-
+    def _visit_cast(self, cast_expr: List[Any]) -> Any:
         expr = cast_expr[0]
-
         if "name" in expr:
             return self.navigator.normalize_token(expr["name"])
-
         elif "register" in expr:
             return {"register": self.navigator.normalize_token(expr["register"]).upper()}
-
         elif "integer" in expr:
-            int_data = expr["integer"][0]
-            if isinstance(int_data, (list, tuple)) and len(int_data) == 2:
-                return {"integer": {"type": int_data[1], "value": int_data[0]}}
-            else:
-                raise ValueError("Should be handled")
-
+            val = expr["integer"][0]
+            return {"integer": {"type": val[1], "value": val[0]}}
         elif "unaryExpression" in expr:
-            return self._process_unary_expression(expr["unaryExpression"])
-
-        else:
-            raise ValueError("Should be handled")
-
+            return self._visit_unary(expr["unaryExpression"])
         return None
 
-    def _process_unary_expression(self, unary_expr: List[Any]) -> Any:
-        """Process unary expression"""
-        if isinstance(unary_expr, list) and len(unary_expr) == 2:
-            operator = self.navigator.normalize_token(unary_expr[0].get("unaryOperator", ""))
-            operand_expr = unary_expr[1]
+    def _visit_unary(self, unary_expr: List[Any]) -> Any:
+        if len(unary_expr) == 2:
+            op = self.navigator.normalize_token(unary_expr[0].get("unaryOperator", ""))
+            operand = self.process({"expression": [unary_expr[1]]})
 
-            # Recursively process the operand
-            operand = self.process({"expression": [operand_expr]})
-
-            # Special case: merge negative sign with integer
             if isinstance(operand, dict) and "integer" in operand:
-                int_data = operand["integer"]
-                if int_data["type"] == "DECIMAL_INTEGER":
-                    return {
-                        "integer": {
-                            "type": int_data["type"],
-                            "value": int(operator + str(int_data["value"]))
-                        }
-                    }
-                else:
-                    raise ValueError("Should be handled")
-            else:
-                raise ValueError("Should be handled")
+                operand["integer"]["value"] = int(f"{op}{operand['integer']['value']}")
+                return operand
+            return {"unary_op": op, "unary_val": operand}
+        return None
 
-            return {"unary_op": operator, "unary_val": operand}
-
-        else:
-            raise ValueError("Should be handled")
-
-    def _process_additive_expression(self, add_expr: List[Any]) -> Any:
-        """Process additive expression"""
+    def _visit_additive(self, add_expr: List[Any]) -> Any:
         operands = []
-
-        for component in add_expr:
-            if isinstance(component, dict):
-                if "multiplicativeExpression" in component or "castExpression" in component:
-                    result = self.process({"expression": [component]})
-                    if isinstance(result, list):
-                        result = {"multiplicative": result}
-                    elif isinstance(result, dict) and len(result) == 1:
-                        pass
-                    else:
-                        raise ValueError("Should be handled")
-                    operands.append(result)
-                else:
-                    raise ValueError("Should be handled")
-            elif "PLUS" in component:
-                continue
-            else:
-                raise ValueError("Should be handled")
-
+        for comp in add_expr:
+            if isinstance(comp, dict):
+                if "multiplicativeExpression" in comp or "castExpression" in comp:
+                    res = self.process({"expression": [comp]})
+                    if isinstance(res, list): res = {"multiplicative": res}
+                    operands.append(res)
         return {"additive": operands} if len(operands) > 1 else (operands[0] if operands else None)
 
-    def _process_multiplicative_expression(self, mul_expr: List[Any]) -> Any:
-        """Process multiplicative expression"""
+    def _visit_multiplicative(self, mul_expr: List[Any]) -> Any:
         operands = []
-
-        for component in mul_expr:
-            if isinstance(component, dict) and "castExpression" in component:
-                operands.append(self.process({"expression": [component]}))
-            elif "MULTIPLICATION" in component:
-                continue
-            else:
-                raise ValueError("Should be handled")
-
+        for comp in mul_expr:
+            if isinstance(comp, dict) and "castExpression" in comp:
+                operands.append(self.process({"expression": [comp]}))
         return operands if len(operands) > 1 else (operands[0] if operands else None)
 
 # ============================================================================
-# Main Transformation Function
+# Main Entry Point
 # ============================================================================
 
 def transform(parse_tree: Dict[str, Any]) -> Dict[str, Any]:
-    """Transform ANTLR parse tree to simplified AST"""
     transformer = AsmTransformer()
     program_data = parse_tree.get("program", [])
-
-    context = {}
-    transformed_program = transformer.visit_program(program_data, context)
-
-    return {"program": transformed_program}
-
-# ============================================================================
-# Usage
-# ============================================================================
+    return transformer.visit_program(program_data, {})
 
 if __name__ == "__main__":
-    import sys
-    import json
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Transform an assembly language parse tree (JSON) into a simplified AST."
-    )
-    args = parser.parse_args()
-
     try:
         parse_tree = json.load(sys.stdin)
-
         result = transform(parse_tree)
-
         json.dump(result, sys.stdout, indent=2)
-
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON input. {e}", file=sys.stderr)
+    except json.JSONDecodeError:
+        print("Error: Invalid JSON input.", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        print(f"Unexpected error: {e}", file=sys.stderr)
         sys.exit(1)
