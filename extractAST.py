@@ -665,8 +665,25 @@ def transform(parse_tree: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================================
 
 if __name__ == "__main__":
-    with open("testParseTree", 'r', encoding="utf-8") as f:
-        parse_tree = json.load(f)
+    import sys
+    import json
+    import argparse
 
-    result = transform(parse_tree)
-    print(json.dumps(result, indent=2))
+    parser = argparse.ArgumentParser(
+        description="Transform an assembly language parse tree (JSON) into a simplified AST."
+    )
+    args = parser.parse_args()
+
+    try:
+        parse_tree = json.load(sys.stdin)
+
+        result = transform(parse_tree)
+
+        json.dump(result, sys.stdout, indent=2)
+
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON input. {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        sys.exit(1)
