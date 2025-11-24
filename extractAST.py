@@ -153,6 +153,17 @@ def transform_program(program_node: List[Any]) -> List[Dict[str, Any]]:
     Transform the top-level 'program' list into the desired structure.
     """
     out = []
+    textSection = {
+                        "directive": {
+                            "name": "section",
+                            "args": [{"type": "NAME", "value": ".text"}],
+                            "blocks": []
+                        }
+                    }
+    globalStore = {"globals": []}
+    out.append(textSection)
+    out.append(globalStore)
+    currentSection = textSection
 
     for node in program_node:
         if not isinstance(node, dict):
@@ -171,13 +182,21 @@ def transform_program(program_node: List[Any]) -> List[Dict[str, Any]]:
                     elif "section_params" in d:
                         name_node = d["section_params"][0].get("name")
                     name = normalize_token(name_node) if name_node else ""
-                    out.append({
-                        "directive": {
-                            "name": "section",
-                            "args": [{"type": "NAME", "value": name}]
+                    if name == ".text":
+                        currentSection = textSection
+                        continue
+                    else:
+                        newSection = {
+                            "directive": {
+                                "name": "section",
+                                "args": [{"type": "NAME", "value": name}],
+                                "blocks": [],
+                                "pseudo_instruct": []
+                            }
                         }
-                    })
-                    continue
+                        out.append(newSection)
+                        currentSection = newSection
+                        continue
 
                 #global
                 elif "global" in d[0]:
@@ -188,12 +207,7 @@ def transform_program(program_node: List[Any]) -> List[Dict[str, Any]]:
                     elif "global_params" in d:
                         name_node = d["global_params"][0].get("name")
                     name = normalize_token(name_node) if name_node else ""
-                    out.append({
-                        "directive": {
-                            "name": "global",
-                            "args": [{"type": "NAME", "value": name}]
-                        }
-                    })
+                    globalStore["globals"].append( {"type": "NAME", "value": name} )
                     continue
             elif "pseudoinstruction" in node["line"][0]:
                 pseudo = node["line"][0]["pseudoinstruction"]
@@ -251,7 +265,7 @@ def transform_program(program_node: List[Any]) -> List[Dict[str, Any]]:
                         raise ValueError("Should be handled")
                 if pseudo_values:
                     pseudo_data["values"] = pseudo_values
-                out.append({"pseudoinstruction": pseudo_data})
+                currentSection["directive"]["pseudo_instruct"].append(pseudo_data)
             else:
                 raise ValueError("Should be handled")
 
@@ -307,7 +321,7 @@ def transform_program(program_node: List[Any]) -> List[Dict[str, Any]]:
                         block_out.append({"instruction": astInstr})
                         continue
 
-            out.append({"block": block_out})
+            currentSection["directive"]["blocks"].append(block_out)
             continue
 
         else:
