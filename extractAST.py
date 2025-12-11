@@ -13,7 +13,7 @@ class ASTVisitor(Protocol):
     """Protocol defining explicit visit methods for AST nodes"""
     def visit_program(self, node: Any, context: Any) -> Any: ...
     def visit_section(self, node: Any, context: Any) -> Any: ...
-    def visit_block(self, node: Any, context: Any) -> Any: ...
+    def visit_lgroup(self, node: Any, context: Any) -> Any: ...
     def visit_instruction(self, node: Any, context: Any) -> Any: ...
     def visit_operand(self, node: Any, context: Any) -> Any: ...
     def visit_label(self, node: Any, context: Any) -> Any: ...
@@ -37,11 +37,11 @@ class Program(ASTNode):
 class Section(ASTNode):
     """Encapsulates code sections (e.g., .text, .data)"""
     name: str
-    blocks: List['BasicBlock'] = field(default_factory=list)
+    lgroups: List['LabelGroup'] = field(default_factory=list)
     pseudo_instruct: List[Dict[str, Any]] = field(default_factory=list)
 
 @dataclass
-class BasicBlock(ASTNode):
+class LabelGroup(ASTNode):
     """A logical block of instructions and labels"""
     instructions: List[Union['Instruction', 'Label']] = field(default_factory=list)
 
@@ -227,8 +227,8 @@ class AsmTransformer(ParseTreeVisitor):
                     context["current_section_dict"] = result
                 elif "global" in result:
                     global_store["globals"].append(result["global"])
-                elif "block" in result:
-                    context["current_section_dict"]["section"]["blocks"].append(result)
+                elif "lgroup" in result:
+                    context["current_section_dict"]["section"]["lgroups"].append(result)
                 elif "pseudo_instruct" in result:
                     context["current_section_dict"]["section"]["pseudo_instruct"].append(result["pseudo_instruct"])
 
@@ -246,18 +246,18 @@ class AsmTransformer(ParseTreeVisitor):
             return self._process_pseudoinstruction(line_content["pseudoinstruction"], context)
         return None
 
-    def visit_block(self, block_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Process a Basic Block of instructions/labels"""
-        block_nodes = []
+    def visit_block(self, lgroup_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Process a logical block of instructions/labels"""
+        lgroup_nodes = []
 
-        for item in block_data:
+        for item in lgroup_data:
             if not isinstance(item, dict):
                 continue
 
             if "label" in item:
                 label_node = self.visit_label(item["label"], context)
                 if label_node:
-                    block_nodes.append(label_node)
+                    lgroup_nodes.append(label_node)
             elif "non_terminator_line" in item or "terminator_line" in item:
                 # Extract instruction data from line wrapper
                 line_node = item.get("non_terminator_line") or item.get("terminator_line")
@@ -265,9 +265,9 @@ class AsmTransformer(ParseTreeVisitor):
                 if instr_data:
                     instr_node = self.visit_instruction(instr_data, context)
                     if instr_node:
-                        block_nodes.append(instr_node)
+                        lgroup_nodes.append(instr_node)
 
-        return {"block": block_nodes} if block_nodes else None
+        return {"lgroup": lgroup_nodes} if lgroup_nodes else None
 
     def visit_label(self, label_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Explicit visitor for Label nodes"""
@@ -475,7 +475,7 @@ class AsmTransformer(ParseTreeVisitor):
     def _section_to_dict(self, section: Section) -> Dict[str, Any]:
         return {
             "name": section.name,
-            "blocks": section.blocks,
+            "lgroups": section.lgroups,
             "pseudo_instruct": section.pseudo_instruct
         }
 
