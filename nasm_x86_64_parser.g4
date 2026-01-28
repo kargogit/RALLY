@@ -581,6 +581,7 @@ opcode
     | IDIV | DIV                    // Division
     | NEG                           // Negation
     | XCHG                          // Exchange
+    | CDQ | CQO | CDQE              // sign-extend instructions (CDQ: EAX->EDX:EAX; CQO: RAX->RDX:RAX; CDQE: EAX->RAX)
     | LOOP | LOOPE | LOOPNE         // Loop control
     | SYSCALL                       // System calls (Linux/Unix PIC)
     | NOT                           // Bitwise NOT
