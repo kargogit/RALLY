@@ -1,140 +1,77 @@
 """
-asm_transformer.py – Step 2 of the NASM -> LLVM-IR pipeline
+asm_transformer.py – Step 2 transformer that consumes a parse-tree
+(dictionary-shaped, as produced by an ANTLR JSON exporter or similar)
+and builds a typed AST using dataclasses from astNodes.py.
 
-This updated module builds a typed, hierarchical AST (dataclasses)
-while keeping the final serialized dict shape compatible with the
-existing pipeline. A single, deterministic serialization step
-(`ast_to_legacy_program_dict`) converts the typed AST into the
-compact JSON-serialisable form (omitting `None`/empty fields and
-preserving the dataclass field declaration order).
+Public interface:
+    transform(parse_tree: Dict[str, Any]) -> Dict[str, Any]
+    (returns the legacy dict format via astNodes.ast_to_legacy_program_dict)
 """
-# =============================================================================
-# Imports
-# =============================================================================
-from typing import Any, Dict, List, Optional, Union, Callable, Protocol
-from dataclasses import dataclass, field, asdict, is_dataclass
-from abc import ABC, abstractmethod
-from collections import defaultdict
+
+from typing import Any, Dict, List, Optional, Callable
+from abc import ABC
 import json
 import sys
 
-# =============================================================================
-# Visitor protocol – defines the contract for concrete AST visitors
-# =============================================================================
-class ASTVisitor(Protocol):
-    def visit_program(self, node: Any, context: Any) -> Any: ...
-    def visit_section(self, node: Any, context: Any) -> Any: ...
-    def visit_lgroup(self, node: Any, context: Any) -> Any: ...
-    def visit_instruction(self, node: Any, context: Any) -> Any: ...
-    def visit_operand(self, node: Any, context: Any) -> Any: ...
-    def visit_label(self, node: Any, context: Any) -> Any: ...
-    def generic_visit(self, node: Any, context: Any) -> Any: ...
+# Import typed AST and serializer
+from astNodes import (
+    Program, Section, LabelGroup, Instruction, Label, Operand,
+    Memory, Immediate, GlobalDecl, ast_to_legacy_program_dict
+)
 
-# =============================================================================
-# Immutable AST node definitions
-# =============================================================================
-@dataclass
-class ASTNode:
-    pass
 
-@dataclass
-class Program(ASTNode):
-    sections: List['Section'] = field(default_factory=list)
-    globals: List[str] = field(default_factory=list)
-
-@dataclass
-class Section(ASTNode):
-    name: str
-    lgroups: List['LabelGroup'] = field(default_factory=list)
-    # Pseudo-instructions are kept as compact dicts for now (they are
-    # already compact JSON shapes and numerous specialised forms exist).
-    pseudo_instruct: List[Dict[str, Any]] = field(default_factory=list)
-
-@dataclass
-class LabelGroup(ASTNode):
-    # A contiguous block of labels and instructions
-    instructions: List[Union['Instruction', 'Label']] = field(default_factory=list)
-
-@dataclass
-class Instruction(ASTNode):
-    opcode: str
-    operands: List['Operand'] = field(default_factory=list)
-    prefix: Optional[str] = None
-
-@dataclass
-class Label(ASTNode):
-    name: str
-
-@dataclass
-class Operand(ASTNode):
-    register: Optional[str] = None
-    memory: Optional['Memory'] = None
-    integer: Optional['Immediate'] = None
-    expression: Optional[Any] = None  # ExpressionVisitor still returns dicts/strings
-    size: Optional[str] = None
-    name: Optional[str] = None
-
-@dataclass
-class Memory(ASTNode):
-    base: Optional[str] = None
-    index: Optional[str] = None
-    scale: Optional[int] = None
-    displacement: Optional[Union[int, str]] = None
-
-@dataclass
-class Immediate(ASTNode):
-    value: Union[int, str]
-    type: str
-
-@dataclass
-class Register(ASTNode):
-    name: str
-
-@dataclass
-class Name(ASTNode):
-    value: str
-
-@dataclass
-class Expression(ASTNode):
-    type: str
-    operands: List[ASTNode] = field(default_factory=list)
-    operator: Optional[str] = None
-
-# Lightweight dataclass used for directive-based globals
-@dataclass
-class GlobalDecl(ASTNode):
-    name: str
-
-# =============================================================================
-# Helper utilities – parsing-tree navigation
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Simple token normalization / parse-tree navigation helper
+# ---------------------------------------------------------------------------
 class ParseTreeNavigator:
     @staticmethod
     def normalize_token(token: Any) -> str:
+        """
+        Robust token normalizer for a variety of parse-tree shapes.
+        The parse trees coming from different ANTLR JSON exporters can vary,
+        so this function attempts to extract a string token from common patterns.
+        """
+        if token is None:
+            return ''
         if isinstance(token, str):
             return token
-        if isinstance(token, (tuple, list)) and len(token) >= 2:
-            if isinstance(token[0], str):
-                return str(token[0])
-            if isinstance(token[1], list) and token[1]:
-                return str(token[1][0])
-        if isinstance(token, list) and len(token) == 1:
-            return ParseTreeNavigator.normalize_token(token[0])
+        if isinstance(token, (list, tuple)):
+            if not token:
+                return ''
+            first = token[0]
+            # nested common forms: [("NAME", ...)] or [('123', 'INT')]
+            if isinstance(first, str):
+                return first
+            if isinstance(first, (list, tuple)) and first:
+                # e.g. (value, type) pattern
+                if isinstance(first[0], str):
+                    return first[0]
+                return str(first[0])
+            # fallback to stringifying the first element
+            return str(first)
         if isinstance(token, dict):
-            for key in ("name", "register", "size", "opcode",
-                        "dx", "terminator_opcode"):
+            # try common keys
+            for key in ("name", "register", "size", "opcode", "dx", "terminator_opcode"):
                 if key in token and token[key]:
                     return ParseTreeNavigator.normalize_token(token[key])
-        return ""
+            # try first value
+            for v in token.values():
+                return ParseTreeNavigator.normalize_token(v)
+        return str(token)
 
-# =============================================================================
-# Generic parse-tree visitor – provides the double-dispatch mechanism
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Generic parse-tree visitor (double-dispatch by key)
+# ---------------------------------------------------------------------------
 class ParseTreeVisitor(ABC):
     def __init__(self):
         self.navigator = ParseTreeNavigator()
 
     def visit(self, node: Any, context: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Inspects a dict node and dispatches to visit_<key> for the first matching key.
+        Returns the result of that visitor or falls back to generic_visit.
+        """
         if not isinstance(node, dict):
             return None
         context = context or {}
@@ -147,10 +84,18 @@ class ParseTreeVisitor(ABC):
     def generic_visit(self, node: Any, context: Dict[str, Any]) -> Any:
         return node
 
-# =============================================================================
-# RIP-relative detection
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# RIP-relative detection helper
+# ---------------------------------------------------------------------------
 class RipRelativeDetector:
+    """
+    Detects common RIP-relative forms in parse-tree operand fragments and
+    returns a Memory dataclass with base='RIP' and a displacement (if found).
+    This detector is conservative and focuses on extraction of symbolic
+    displacements so that RIP-relative addressing is a first-class operand.
+    """
+
     def __init__(self, navigator: ParseTreeNavigator):
         self.navigator = navigator
 
@@ -164,55 +109,65 @@ class RipRelativeDetector:
 
     def _has_rip_or_rel(self, node: Any) -> bool:
         if isinstance(node, dict):
-            for key, value in node.items():
-                if key in ('rel', 'rip'):
+            for k, v in node.items():
+                if k in ('rel', 'rip'):
                     return True
-                if self._has_rip_or_rel(value):
+                if self._has_rip_or_rel(v):
                     return True
         elif isinstance(node, list):
             return any(self._has_rip_or_rel(item) for item in node)
         return False
 
-    def _extract_rip_displacement(self, operand_data: Any) -> Optional[Union[int, str]]:
+    def _extract_rip_displacement(self, operand_data: Any) -> Optional[object]:
+        # Best-effort: look for 'expression' containers or 'name' tokens inside lists/dicts
         if isinstance(operand_data, list):
             for item in operand_data:
                 if isinstance(item, dict) and 'expression' in item:
                     expr = item['expression']
                     if isinstance(expr, list) and expr:
                         return self._extract_from_expression(expr[0])
+                if isinstance(item, dict) and 'name' in item:
+                    return self.navigator.normalize_token(item['name'])
+        if isinstance(operand_data, dict):
+            if 'name' in operand_data:
+                return self.navigator.normalize_token(operand_data['name'])
         return None
 
-    def _extract_from_expression(self, expr_data: Any) -> Optional[Union[int, str]]:
+    def _extract_from_expression(self, expr_data: Any) -> Optional[object]:
         if not isinstance(expr_data, dict):
             return None
-        if 'additiveExpression' in expr_data:
-            add_expr = expr_data['additiveExpression']
-            if len(add_expr) > 1:
-                for part in add_expr:
-                    if isinstance(part, dict):
-                        res = self._extract_from_expression(part)
-                        if res:
-                            return res
-        if 'multiplicativeExpression' in expr_data:
-            return self._extract_from_expression(expr_data['multiplicativeExpression'][0])
-        if 'castExpression' in expr_data:
-            return self._extract_from_expression(expr_data['castExpression'][0])
-        if 'unaryExpression' in expr_data and len(expr_data['unaryExpression']) > 1:
-            return self._extract_from_expression(expr_data['unaryExpression'][1])
+        # try a few layers similar to original design
+        for key in ('additiveExpression', 'multiplicativeExpression', 'castExpression', 'unaryExpression'):
+            if key in expr_data and expr_data[key]:
+                elem = expr_data[key][0]
+                # recurse
+                if isinstance(elem, dict):
+                    if 'name' in elem:
+                        return self.navigator.normalize_token(elem['name'])
+                    if 'integer' in elem:
+                        int_item = elem['integer'][0]
+                        if isinstance(int_item, (list, tuple)) and int_item:
+                            return int_item[0]
+                    # deeper recursion
+                    res = self._extract_from_expression(elem)
+                    if res is not None:
+                        return res
+        # fallback to top-level name/integer
         if 'name' in expr_data:
             return self.navigator.normalize_token(expr_data['name'])
         if 'integer' in expr_data:
             int_data = expr_data['integer'][0]
-            if isinstance(int_data, (list, tuple)) and len(int_data) == 2:
+            if isinstance(int_data, (list, tuple)):
                 return int_data[0]
         return None
 
-# =============================================================================
-# Transformation registry
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Transformation registry for small reusable handlers
+# ---------------------------------------------------------------------------
 class TransformationRegistry:
     def __init__(self):
-        self._handlers: Dict[str, Callable] = {}
+        self._handlers = {}
 
     def register(self, node_type: str):
         def decorator(func: Callable):
@@ -220,27 +175,28 @@ class TransformationRegistry:
             return func
         return decorator
 
-    def transform(self, node_type: str, data: Any,
-                  context: Optional[Dict[str, Any]] = None) -> Any:
+    def transform(self, node_type: str, data: Any, context: Optional[Dict[str, Any]] = None) -> Any:
         handler = self._handlers.get(node_type)
         if handler:
             return handler(data, context or {})
         return None
 
-# =============================================================================
-# Expression visitor – unchanged behaviour (returns simple dicts/strings)
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Expression visitor: lightweight expression extraction for immediates, names.
+# ---------------------------------------------------------------------------
 class ExpressionVisitor:
     def __init__(self, navigator: ParseTreeNavigator):
         self.navigator = navigator
 
     def process(self, expr_container: Dict[str, Any]) -> Any:
-        if 'expression' not in expr_container:
+        if not expr_container or 'expression' not in expr_container:
             return None
         expr_list = expr_container['expression']
         if not expr_list or not isinstance(expr_list[0], dict):
             return None
         actual_expr = expr_list[0]
+        # simple patterns handled: castExpression, additiveExpression, multiplicativeExpression
         if 'castExpression' in actual_expr:
             return self._visit_cast(actual_expr['castExpression'])
         if 'additiveExpression' in actual_expr:
@@ -264,10 +220,18 @@ class ExpressionVisitor:
 
     def _visit_unary(self, unary_expr: List[Any]) -> Any:
         if len(unary_expr) == 2:
-            op = self.navigator.normalize_token(unary_expr[0].get('unaryOperator', ''))
+            op_token = unary_expr[0].get('unaryOperator', '')
+            op = self.navigator.normalize_token(op_token)
             operand = self.process({'expression': [unary_expr[1]]})
             if isinstance(operand, dict) and 'integer' in operand:
-                operand['integer']['value'] = int(f"{op}{operand['integer']['value']}")
+                # make sure integer value is signed if unary contains '-'
+                try:
+                    operand_value = int(operand['integer']['value'])
+                    if op == '-':
+                        operand['integer']['value'] = -operand_value
+                except Exception:
+                    # keep original if conversion fails
+                    pass
                 return operand
             return {'unary_op': op, 'unary_val': operand}
         return None
@@ -278,27 +242,31 @@ class ExpressionVisitor:
             if isinstance(comp, dict):
                 if 'multiplicativeExpression' in comp or 'castExpression' in comp:
                     res = self.process({'expression': [comp]})
-                    if isinstance(res, list):
-                        res = {'multiplicative': res}
                     operands.append(res)
-        return {'additive': operands} if len(operands) > 1 else (operands[0] if operands else None)
+        if not operands:
+            return None
+        return {'additive': operands} if len(operands) > 1 else operands[0]
 
     def _visit_multiplicative(self, mul_expr: List[Any]) -> Any:
         operands = []
         for comp in mul_expr:
             if isinstance(comp, dict) and 'castExpression' in comp:
                 operands.append(self.process({'expression': [comp]}))
-        return operands if len(operands) > 1 else (operands[0] if operands else None)
+        if not operands:
+            return None
+        return operands if len(operands) > 1 else operands[0]
 
-# =============================================================================
-# Concrete visitor – builds typed AST instances
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Concrete transformer: builds typed dataclasses and uses serializer for output
+# ---------------------------------------------------------------------------
 class AsmTransformer(ParseTreeVisitor):
     def __init__(self):
         super().__init__()
         self.registry = TransformationRegistry()
         self.rip_detector = RipRelativeDetector(self.navigator)
         self._setup_handlers()
+        # default text section present to preserve legacy behavior
         self.text_section = Section(name='.text')
 
     def _setup_handlers(self):
@@ -306,7 +274,7 @@ class AsmTransformer(ParseTreeVisitor):
         def handle_integer(data, ctx):
             if isinstance(data, list) and data:
                 int_data = data[0]
-                if isinstance(int_data, (list, tuple)) and len(int_data) == 2:
+                if isinstance(int_data, (list, tuple)) and len(int_data) >= 2:
                     return Immediate(value=int_data[0], type=int_data[1])
             return None
 
@@ -322,7 +290,7 @@ class AsmTransformer(ParseTreeVisitor):
         def handle_instruction(data, ctx):
             return self.visit_instruction(data, ctx)
 
-    # Program entry point builds a Program dataclass
+    # Top-level program builder
     def visit_program(self, program_data: List[Any], context: Dict[str, Any]) -> Program:
         prog = Program(sections=[self.text_section])
         context['current_section'] = self.text_section
@@ -334,7 +302,7 @@ class AsmTransformer(ParseTreeVisitor):
             if result is None:
                 continue
             if isinstance(result, Section):
-                # do not duplicate the .text section
+                # do not duplicate .text section
                 if result.name != '.text':
                     prog.sections.append(result)
                 context['current_section'] = result
@@ -344,12 +312,12 @@ class AsmTransformer(ParseTreeVisitor):
                 ctx_sec: Section = context['current_section']
                 ctx_sec.lgroups.append(result)
             elif isinstance(result, dict) and 'pseudo_instruct' in result:
-                # some pseudo processing still returns compact dicts
                 ctx_sec: Section = context['current_section']
                 ctx_sec.pseudo_instruct.append(result['pseudo_instruct'])
 
         return prog
 
+    # generic line visitor that handles directive/pseudoinstruction etc.
     def visit_line(self, line_data: List[Any], context: Dict[str, Any]) -> Optional[Any]:
         if not line_data or not isinstance(line_data[0], dict):
             return None
@@ -371,6 +339,8 @@ class AsmTransformer(ParseTreeVisitor):
                     lg.instructions.append(label_node)
             elif 'non_terminator_line' in item or 'terminator_line' in item:
                 line_node = item.get('non_terminator_line') or item.get('terminator_line')
+                if not line_node or not isinstance(line_node, list) or not line_node[0]:
+                    continue
                 instr_data = (line_node[0].get('instruction') or line_node[0].get('terminator_instruction'))
                 if instr_data:
                     instr_node = self.visit_instruction(instr_data, context)
@@ -425,7 +395,8 @@ class AsmTransformer(ParseTreeVisitor):
                 op.name = self.navigator.normalize_token(item['name'])
         return op
 
-    def _process_directive(self, directive_data: List[Any], context: Dict[str, Any]) -> Optional[Union[Section, GlobalDecl]]:
+    # directives and pseudoinstructions
+    def _process_directive(self, directive_data: List[Any], context: Dict[str, Any]) -> Optional[object]:
         if not directive_data or len(directive_data) < 2:
             return None
         directive_type = directive_data[0]
@@ -544,103 +515,24 @@ class AsmTransformer(ParseTreeVisitor):
             return self.navigator.normalize_token(params[0].get('name'))
         return ''
 
-# =============================================================================
-# Deterministic AST -> legacy-dict serializer
-# =============================================================================
 
-def _serialize_operand(op: Operand) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    if op.register:
-        out['register'] = op.register
-    if op.size:
-        out['size'] = op.size
-    if op.expression is not None:
-        out['expression'] = op.expression
-    if op.integer is not None:
-        out['integer'] = {'value': op.integer.value, 'type': op.integer.type}
-    if op.name is not None:
-        out['name'] = op.name
-    if op.memory is not None:
-        mem = {}
-        if op.memory.base is not None:
-            mem['base'] = op.memory.base
-        if op.memory.index is not None:
-            mem['index'] = op.memory.index
-        if op.memory.scale is not None:
-            mem['scale'] = op.memory.scale
-        if op.memory.displacement is not None:
-            mem['displacement'] = op.memory.displacement
-        out['memory'] = mem
-    return out
-
-
-def _serialize_instruction(instr: Instruction) -> Dict[str, Any]:
-    res: Dict[str, Any] = {'opcode': instr.opcode}
-    if instr.prefix:
-        res['prefix'] = instr.prefix
-    if instr.operands:
-        res['operands'] = [_serialize_operand(o) for o in instr.operands]
-    return res
-
-
-def _serialize_lgroup(lg: LabelGroup) -> Dict[str, Any]:
-    items: List[Dict[str, Any]] = []
-    for it in lg.instructions:
-        if isinstance(it, Label):
-            items.append({'label': it.name})
-        elif isinstance(it, Instruction):
-            items.append({'instruction': _serialize_instruction(it)})
-    return {'lgroup': items}
-
-
-def ast_to_legacy_section_dict(section: Section) -> Dict[str, Any]:
-    sec: Dict[str, Any] = {'name': section.name}
-    if section.lgroups:
-        sec['lgroups'] = [_serialize_lgroup(lg) for lg in section.lgroups]
-    if section.pseudo_instruct:
-        sec['pseudo_instruct'] = section.pseudo_instruct
-    return sec
-
-
-def ast_to_legacy_program_dict(program: Program) -> Dict[str, Any]:
-    # Preserve legacy top-level shape: {"program": [ {"section": ...}, {"globals": [...] } ] }
-    out: List[Any] = []
-    # first entry: always the .text section (ensure it exists)
-    # find .text in program.sections (there should be at least one)
-    text_sec = None
-    for s in program.sections:
-        if s.name == '.text':
-            text_sec = s
-            break
-    if text_sec is None and program.sections:
-        text_sec = program.sections[0]
-    if text_sec is None:
-        text_sec = Section(name='.text')
-    out.append({'section': ast_to_legacy_section_dict(text_sec)})
-
-    # append globals store as second element (legacy behaviour)
-    out.append({'globals': program.globals})
-
-    # append other sections in order (excluding the already appended .text)
-    for s in program.sections:
-        if s.name == '.text':
-            continue
-        out.append({'section': ast_to_legacy_section_dict(s)})
-
-    return {'program': out}
-
-# =============================================================================
-# Public API – transform now returns the legacy dict but uses typed AST
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Public API: transform(parse_tree) -> legacy dict (uses typed AST internally)
+# ---------------------------------------------------------------------------
 def transform(parse_tree: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build typed AST from parse_tree and return legacy dict form.
+    parse_tree is expected to be a dict with key 'program' mapping to a list.
+    """
     transformer = AsmTransformer()
     program_data = parse_tree.get('program', [])
     ast_root = transformer.visit_program(program_data, {})
     return ast_to_legacy_program_dict(ast_root)
 
-# =============================================================================
-# CLI driver
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# CLI driver (JSON in / JSON out)
+# ---------------------------------------------------------------------------
 if __name__ == '__main__':
     try:
         parse_tree = json.load(sys.stdin)
