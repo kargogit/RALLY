@@ -1,5 +1,5 @@
 """
-asm_transformer.py – Step 2 transformer that consumes a parse-tree
+extractAST.py – Step 2 transformer that consumes a parse-tree
 (dictionary-shaped, as produced by an ANTLR JSON exporter or similar)
 and builds a typed AST using dataclasses from astNodes.py.
 
@@ -333,7 +333,7 @@ class AsmTransformer(ParseTreeVisitor):
                 prog.globals.append(result.name)
             elif isinstance(result, LabelGroup):
                 ctx_sec: Section = context['current_section']
-                ctx_sec.lgroups.append(result)
+                ctx_sec.children.append(result)
             elif isinstance(result, dict) and 'pseudo_instruct' in result:
                 ctx_sec: Section = context['current_section']
                 ctx_sec.pseudo_instruct.append(result['pseudo_instruct'])
