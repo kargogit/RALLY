@@ -1,5 +1,5 @@
 """
-ast_nodes.py
+astNodes.py
 
 Typed AST dataclasses and deterministic serializer for pipeline Step 2.
 
@@ -29,7 +29,7 @@ class Program(ASTNode):
 @dataclass
 class Section(ASTNode):
     name: str
-    lgroups: List['LabelGroup'] = field(default_factory=list)
+    children: List[Union['LabelGroup', 'Function']] = field(default_factory=list)
     pseudo_instruct: List[Dict[str, Any]] = field(default_factory=list)
     location: Optional[Dict[str, Any]] = None
 
@@ -41,6 +41,29 @@ class LabelGroup(ASTNode):
     `instructions` is an ordered list containing Label or Instruction instances.
     """
     instructions: List[Union['Instruction', 'Label']] = field(default_factory=list)
+
+
+@dataclass
+class BasicBlock(ASTNode):
+    """
+    A basic block of instructions.
+    `instructions` is an ordered list containing Instruction instances.
+    """
+    instructions: List['Instruction'] = field(default_factory=list)
+    id: str = field(default_factory=lambda: str(hash(frozenset())))  # Unique identifier
+    start_label: Optional['Label'] = None
+    location: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class Function(ASTNode):
+    """
+    A function that groups basic blocks.
+    `basic_blocks` is an ordered list containing BasicBlock instances.
+    """
+    basic_blocks: List['BasicBlock'] = field(default_factory=list)
+    entry_label: Optional[str] = None
+    location: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -143,27 +166,72 @@ def _serialize_instruction(instr: Instruction) -> Dict[str, Any]:
     return res
 
 
-def _serialize_lgroup(lg: LabelGroup) -> Dict[str, Any]:
+def _serialize_basic_block(bb: BasicBlock, include_instr_locations: bool = False) -> Dict[str, Any]:
+    """
+    Serialize a BasicBlock. For each instruction we produce an item shaped like
+      { "instruction": { ... }, "location": { ... }? }
+    The presence of the per-instruction "location" entry is controlled by
+    `include_instr_locations` to reduce verbosity when desired.
+    """
+    res: Dict[str, Any] = {}
+    items: List[Dict[str, Any]] = []
+    for instr in bb.instructions:
+        instr_dict = _serialize_instruction(instr)
+        item: Dict[str, Any] = {'instruction': instr_dict}
+        # conditionally preserve per-instruction location
+        if include_instr_locations and getattr(instr, 'location', None):
+            item['location'] = instr.location
+        items.append(item)
+
+    res['instructions'] = items
+    res['id'] = bb.id
+    if bb.start_label:
+        res['start_label'] = bb.start_label.name
+    if bb.location:
+        res['location'] = bb.location
+    return res
+
+
+def _serialize_function(func: Function, include_instr_locations: bool = False) -> Dict[str, Any]:
+    res: Dict[str, Any] = {}
+    res['basic_blocks'] = [_serialize_basic_block(bb, include_instr_locations=include_instr_locations) for bb in func.basic_blocks]
+    if func.entry_label:
+        res['entry_label'] = func.entry_label
+    if func.location:
+        res['location'] = func.location
+    return res
+
+
+def _serialize_lgroup(lg: LabelGroup, include_instr_locations: bool = False) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
     for it in lg.instructions:
         if isinstance(it, Label):
             item: Dict[str, Any] = {'label': it.name}
+            # label-level location stays (labels are higher-level than per-instruction)
             if it.location:
                 item['location'] = it.location
             items.append(item)
         elif isinstance(it, Instruction):
             instr_dict = _serialize_instruction(it)
             item: Dict[str, Any] = {'instruction': instr_dict}
-            if it.location:
+            # only include instruction-level location if requested
+            if include_instr_locations and it.location:
                 item['location'] = it.location
             items.append(item)
     return {'lgroup': items}
 
 
-def ast_to_legacy_section_dict(section: Section) -> Dict[str, Any]:
+def ast_to_legacy_section_dict(section: Section, include_instr_locations: bool = False) -> Dict[str, Any]:
     sec: Dict[str, Any] = {'name': section.name}
-    if section.lgroups:
-        sec['lgroups'] = [_serialize_lgroup(lg) for lg in section.lgroups]
+    children = []
+    for child in section.children:
+        if isinstance(child, LabelGroup):
+            # _serialize_lgroup already returns {'lgroup': items}
+            children.append(_serialize_lgroup(child, include_instr_locations=include_instr_locations))
+        elif isinstance(child, Function):
+            children.append({'function': _serialize_function(child, include_instr_locations=include_instr_locations)})
+    if children:
+        sec['children'] = children
     if section.pseudo_instruct:
         sec['pseudo_instruct'] = section.pseudo_instruct
     if section.location:
@@ -171,15 +239,13 @@ def ast_to_legacy_section_dict(section: Section) -> Dict[str, Any]:
     return sec
 
 
-def ast_to_legacy_program_dict(program: Program) -> Dict[str, Any]:
+def ast_to_legacy_program_dict(program: Program, include_instr_locations: bool = False) -> Dict[str, Any]:
     """
     Backwards-compatible legacy shape:
       {"program": [ {"section": ...}, {"globals":[...]} , {"section": ...}, ... ]}
 
-    Guarantees deterministic ordering:
-      - first entry is .text (if present), else first section or an empty .text
-      - second entry is globals list
-      - then other sections in order
+    Passing include_instr_locations=True will preserve per-instruction location
+    objects in the produced legacy dict; default is False to reduce verbosity.
     """
     out: List[Union[Dict[str, Any], Any]] = []
 
@@ -194,15 +260,16 @@ def ast_to_legacy_program_dict(program: Program) -> Dict[str, Any]:
     if text_sec is None:
         text_sec = Section(name='.text')
 
-    out.append({'section': ast_to_legacy_section_dict(text_sec)})
+    out.append({'section': ast_to_legacy_section_dict(text_sec, include_instr_locations=include_instr_locations)})
     out.append({'globals': program.globals})
 
     for s in program.sections:
         if s is text_sec:
             continue
-        out.append({'section': ast_to_legacy_section_dict(s)})
+        out.append({'section': ast_to_legacy_section_dict(s, include_instr_locations=include_instr_locations)})
 
     return {'program': out}
+
 
 # ---------------------------------------------------------------------------
 # Deterministic deserializer: legacy dict shape -> typed AST
@@ -245,6 +312,54 @@ def _deserialize_instruction(instr_dict: Dict[str, Any]) -> Instruction:
     operands = [_deserialize_operand(o) for o in operands_dicts]
     return Instruction(opcode=opcode, operands=operands, prefix=prefix)
 
+
+def _deserialize_basic_block(bb_dict: Dict[str, Any]) -> BasicBlock:
+    """
+    Accept both the new wrapped form:
+        {"instruction": {...}, "location": {...}?}
+    and the old bare-form (legacy):
+        {...}  (an instruction dict)
+    This preserves backward compatibility with any older data.
+    """
+    instructions_entries = bb_dict.get('instructions', [])
+    instructions: List[Instruction] = []
+
+    for entry in instructions_entries:
+        if isinstance(entry, dict) and 'instruction' in entry:
+            # new wrapped form
+            instr_dict = entry['instruction']
+            instr = _deserialize_instruction(instr_dict)
+            # restore per-instruction location if present
+            if 'location' in entry:
+                instr.location = entry['location']
+            instructions.append(instr)
+        elif isinstance(entry, dict):
+            # legacy plain instruction dict form (keep working with old data)
+            instr = _deserialize_instruction(entry)
+            instructions.append(instr)
+        else:
+            raise ValueError(f"Invalid instruction entry in basic block: {repr(entry)}")
+
+    bb = BasicBlock(instructions=instructions)
+    if 'id' in bb_dict:
+        bb.id = bb_dict['id']
+    if 'start_label' in bb_dict:
+        bb.start_label = Label(name=bb_dict['start_label'])
+    if 'location' in bb_dict:
+        bb.location = bb_dict['location']
+    return bb
+
+def _deserialize_function(func_dict: Dict[str, Any]) -> Function:
+    basic_blocks_dicts = func_dict.get('basic_blocks', [])
+    basic_blocks = [_deserialize_basic_block(bb) for bb in basic_blocks_dicts]
+    func = Function(basic_blocks=basic_blocks)
+    if 'entry_label' in func_dict:
+        func.entry_label = func_dict['entry_label']
+    if 'location' in func_dict:
+        func.location = func_dict['location']
+    return func
+
+
 def _deserialize_lgroup(lg_dict: Dict[str, Any]) -> LabelGroup:
     if 'lgroup' not in lg_dict:
         raise ValueError("Expected 'lgroup' key in label group dict")
@@ -263,15 +378,23 @@ def _deserialize_lgroup(lg_dict: Dict[str, Any]) -> LabelGroup:
             raise ValueError(f"Invalid item in lgroup: {it.keys()}")
     return LabelGroup(instructions=instructions)
 
+
 def _deserialize_section(sec_dict: Dict[str, Any]) -> Section:
     if 'name' not in sec_dict:
         raise ValueError("Section dict missing 'name'")
     name = sec_dict['name']
     location = sec_dict.get('location')
-    lgroups_dicts = sec_dict.get('lgroups', [])
-    lgroups = [_deserialize_lgroup(lg) for lg in lgroups_dicts]
+    children = []
+    children_dicts = sec_dict.get('children', [])
+    for child_dict in children_dicts:
+        if 'lgroup' in child_dict:
+            # pass the child dict (which has 'lgroup' key) to the lgroup deserializer
+            children.append(_deserialize_lgroup(child_dict))
+        elif 'function' in child_dict:
+            children.append(_deserialize_function(child_dict['function']))
     pseudo_instruct = sec_dict.get('pseudo_instruct', [])
-    return Section(name=name, lgroups=lgroups, pseudo_instruct=pseudo_instruct, location=location)
+    return Section(name=name, children=children, pseudo_instruct=pseudo_instruct, location=location)
+
 
 def legacy_program_dict_to_ast(program_dict: Dict[str, Any]) -> Program:
     """

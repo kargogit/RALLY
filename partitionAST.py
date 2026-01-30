@@ -20,6 +20,8 @@ from astNodes import (
     Instruction,
     BasicBlock,
     Function,
+    ast_to_legacy_program_dict,
+    legacy_program_dict_to_ast
 )
 
 # Config: which section names are considered executable (partitioned)
@@ -450,10 +452,22 @@ def partition_and_serialize(program: Program) -> Dict[str, Any]:
 if __name__ == '__main__':
     import sys
     import json
-    from astNodes import legacy_program_dict_to_ast, ast_to_legacy_program_dict
+    import argparse
 
     def eprint(*args, **kwargs):
         print(*args, file=sys.stderr, **kwargs)
+
+    parser = argparse.ArgumentParser(
+        description="Partition typed AST into Functions and BasicBlocks and output legacy JSON."
+    )
+    # The user asked for flag name "-iloc". We support that and a more explicit long form.
+    parser.add_argument(
+        '-iloc',
+        '--include-instr-locations',
+        action='store_true',
+        help='Include per-instruction source locations in the output JSON (verbose).'
+    )
+    args = parser.parse_args()
 
     try:
         raw = sys.stdin.read()
@@ -463,8 +477,11 @@ if __name__ == '__main__':
 
         obj = json.loads(raw)
         program = legacy_program_dict_to_ast(obj)
+        # Partition in-place
         partition_program_into_functions_and_basic_blocks(program)
-        out_dict = ast_to_legacy_program_dict(program)
+
+        # Serialize with the requested verbosity
+        out_dict = ast_to_legacy_program_dict(program, include_instr_locations=args.include_instr_locations)
         json.dump(out_dict, sys.stdout, indent=2)
         sys.stdout.write("\n")
 
