@@ -567,28 +567,29 @@ instruction
 
 opcode
     : MOV | LEA
-    | PUSH | POP                    // Stack operations
-    | ADD | SUB | INC | DEC         // Arithmetic
-    | MOVSS | ADDSS | MULSS         // Floating-Point Arithmetic (SSE)
-    | CVTTSS2SI                     // Floating-Point to Integer Conversion (SSE)
-    | CMP | TEST | SETNE | SETC     // Comparison
-    | AND | OR | XOR                // Logical
-    | SHL | SHR | SAR               // Bit shifts
-    | CALL | JMP | RET              // Control flow (if not in terminator_instruction)
-    | NOP                           // No operation
-    | MOVSX | MOVZX | MOVSXD        // Sign/zero extend (essential for type conversions)
-    | IMUL | MUL                    // Multiplication
-    | IDIV | DIV                    // Division
-    | NEG                           // Negation
-    | XCHG                          // Exchange
-    | CDQ | CQO | CDQE              // sign-extend instructions (CDQ: EAX->EDX:EAX; CQO: RAX->RDX:RAX; CDQE: EAX->RAX)
-    | LOOP | LOOPE | LOOPNE         // Loop control
-    | SYSCALL                       // System calls (Linux/Unix PIC)
-    | NOT                           // Bitwise NOT
-    | ROL | ROR                     // Rotate
-    | BT | BTS | BTR | BTC          // Bit test and set
-    | LEA                           // RIP-relative addressing
-    | UD2                           // Undefined instruction (for deliberate faults)
+    | PUSH | POP                            // Stack operations
+    | ADD | SUB | INC | DEC                 // Arithmetic
+    | MOVSS | ADDSS | MULSS                 // Floating-Point Arithmetic (SSE)
+    | CVTTSS2SI                             // Floating-Point to Integer Conversion (SSE)
+    | CMP | TEST | SETNE | SETC | SETPE     // Comparison
+    | CMOVNE                                // Conditional move (move if not-equal / ZF == 0)
+    | AND | OR | XOR                        // Logical
+    | SHL | SHR | SAR                       // Bit shifts
+    | CALL | JMP | RET                      // Control flow (if not in terminator_instruction)
+    | NOP                                   // No operation
+    | MOVSX | MOVZX | MOVSXD                // Sign/zero extend (essential for type conversions)
+    | IMUL | MUL                            // Multiplication
+    | IDIV | DIV                            // Division
+    | NEG                                   // Negation
+    | XCHG                                  // Exchange
+    | CDQ | CQO | CDQE                      // sign-extend instructions (CDQ: EAX->EDX:EAX; CQO: RAX->RDX:RAX; CDQE: EAX->RAX)
+    | LOOP | LOOPE | LOOPNE                 // Loop control
+    | SYSCALL                               // System calls (Linux/Unix PIC)
+    | NOT                                   // Bitwise NOT
+    | ROL | ROR                             // Rotate
+    | BT | BTS | BTR | BTC                  // Bit test and set
+    | LEA                                   // RIP-relative addressing
+    | UD2                                   // Undefined instruction (for deliberate faults)
     ;
 
 segment_register
