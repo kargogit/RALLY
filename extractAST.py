@@ -75,6 +75,28 @@ class ParseTreeVisitor(ABC):
         if not isinstance(node, dict):
             return None
         context = context or {}
+        prev_loc = context.get('current_loc')
+        current_loc = node.get('_loc')
+
+        if current_loc:
+            context['current_loc'] = current_loc
+
+        try:
+            for key in node:
+                if key == '_loc':
+                    continue
+                method_name = f"visit_{key}"
+                if hasattr(self, method_name):
+                    return getattr(self, method_name)(node[key], context)
+            return self.generic_visit(node, context)
+        finally:
+            # Restore previous location (safe for nested nodes)
+            if current_loc:
+                if prev_loc is not None:
+                    context['current_loc'] = prev_loc
+                elif 'current_loc' in context:
+                    del context['current_loc']
+
         for key in node.keys():
             method_name = f"visit_{key}"
             if hasattr(self, method_name):
@@ -352,10 +374,16 @@ class AsmTransformer(ParseTreeVisitor):
         if not label_data or not isinstance(label_data[0], dict):
             return None
         name = self.navigator.normalize_token(label_data[0].get('name'))
-        return Label(name=name)
+        label = Label(name=name)
+        if context.get('current_loc'):
+            label.location = context['current_loc']
+        return label
 
     def visit_instruction(self, instr_data: List[Any], context: Dict[str, Any]) -> Optional[Instruction]:
         instr = Instruction(opcode='')
+        loc = context.get('current_loc')
+        if loc:
+            instr.location = loc  # no copy needed; dict is read-only here
         for piece in instr_data:
             if not isinstance(piece, dict):
                 continue
@@ -405,10 +433,15 @@ class AsmTransformer(ParseTreeVisitor):
             if name == '.text':
                 return self.text_section
             new_section = Section(name=name)
+            if context.get('current_loc'):
+                new_section.location = context['current_loc']
             return new_section
         if 'global' in directive_type:
             name = self._extract_global_name(directive_data)
-            return GlobalDecl(name=name)
+            decl = GlobalDecl(name=name)
+            if context.get('current_loc'):
+                decl.location = context['current_loc']
+            return decl
         return None
 
     def _process_pseudoinstruction(self, pseudo_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:

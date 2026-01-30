@@ -31,6 +31,7 @@ class Section(ASTNode):
     name: str
     lgroups: List['LabelGroup'] = field(default_factory=list)
     pseudo_instruct: List[Dict[str, Any]] = field(default_factory=list)
+    location: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -47,11 +48,13 @@ class Instruction(ASTNode):
     opcode: str
     operands: List['Operand'] = field(default_factory=list)
     prefix: Optional[str] = None
+    location: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class Label(ASTNode):
     name: str
+    location: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -98,6 +101,7 @@ class Expression(ASTNode):
 @dataclass
 class GlobalDecl(ASTNode):
     name: str
+    location: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +147,16 @@ def _serialize_lgroup(lg: LabelGroup) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
     for it in lg.instructions:
         if isinstance(it, Label):
-            items.append({'label': it.name})
+            item: Dict[str, Any] = {'label': it.name}
+            if it.location:
+                item['location'] = it.location
+            items.append(item)
         elif isinstance(it, Instruction):
-            items.append({'instruction': _serialize_instruction(it)})
+            instr_dict = _serialize_instruction(it)
+            item: Dict[str, Any] = {'instruction': instr_dict}
+            if it.location:
+                item['location'] = it.location
+            items.append(item)
     return {'lgroup': items}
 
 
@@ -155,6 +166,8 @@ def ast_to_legacy_section_dict(section: Section) -> Dict[str, Any]:
         sec['lgroups'] = [_serialize_lgroup(lg) for lg in section.lgroups]
     if section.pseudo_instruct:
         sec['pseudo_instruct'] = section.pseudo_instruct
+    if section.location:
+        sec['location'] = section.location
     return sec
 
 
@@ -238,10 +251,14 @@ def _deserialize_lgroup(lg_dict: Dict[str, Any]) -> LabelGroup:
     items = lg_dict['lgroup']
     instructions: List[Union[Instruction, Label]] = []
     for it in items:
+        location = it.get('location')
         if 'label' in it:
-            instructions.append(Label(name=it['label']))
+            instructions.append(Label(name=it['label'], location=location))
         elif 'instruction' in it:
-            instructions.append(_deserialize_instruction(it['instruction']))
+            instr_dict = it['instruction']
+            instr = _deserialize_instruction(instr_dict)
+            instr.location = location
+            instructions.append(instr)
         else:
             raise ValueError(f"Invalid item in lgroup: {it.keys()}")
     return LabelGroup(instructions=instructions)
@@ -250,10 +267,11 @@ def _deserialize_section(sec_dict: Dict[str, Any]) -> Section:
     if 'name' not in sec_dict:
         raise ValueError("Section dict missing 'name'")
     name = sec_dict['name']
+    location = sec_dict.get('location')
     lgroups_dicts = sec_dict.get('lgroups', [])
     lgroups = [_deserialize_lgroup(lg) for lg in lgroups_dicts]
     pseudo_instruct = sec_dict.get('pseudo_instruct', [])
-    return Section(name=name, lgroups=lgroups, pseudo_instruct=pseudo_instruct)
+    return Section(name=name, lgroups=lgroups, pseudo_instruct=pseudo_instruct, location=location)
 
 def legacy_program_dict_to_ast(program_dict: Dict[str, Any]) -> Program:
     """
