@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Callable
 from abc import ABC
 import json
 import sys
+import copy
 
 # Import typed AST and serializer
 from astNodes import (
@@ -365,9 +366,31 @@ class AsmTransformer(ParseTreeVisitor):
                     continue
                 instr_data = (line_node[0].get('instruction') or line_node[0].get('terminator_instruction'))
                 if instr_data:
-                    instr_node = self.visit_instruction(instr_data, context)
+                    # Prefer the explicit _loc present on the wrapper node (item or line_node[0])
+                    prev_loc = context.get('current_loc')
+                    new_loc = None
+                    # check the outer item first (some exporters put _loc there)
+                    if isinstance(item, dict) and '_loc' in item:
+                        new_loc = item['_loc']
+                    # otherwise prefer the line wrapper's _loc if present
+                    elif isinstance(line_node[0], dict) and '_loc' in line_node[0]:
+                        new_loc = line_node[0]['_loc']
+
+                    if new_loc is not None:
+                        context['current_loc'] = new_loc
+
+                    try:
+                        instr_node = self.visit_instruction(instr_data, context)
+                    finally:
+                        # restore previous location (or remove if none)
+                        if prev_loc is not None:
+                            context['current_loc'] = prev_loc
+                        elif 'current_loc' in context:
+                            del context['current_loc']
+
                     if instr_node:
                         lg.instructions.append(instr_node)
+
         return lg if lg.instructions else None
 
     def visit_label(self, label_data: List[Any], context: Dict[str, Any]) -> Optional[Label]:
@@ -381,9 +404,22 @@ class AsmTransformer(ParseTreeVisitor):
 
     def visit_instruction(self, instr_data: List[Any], context: Dict[str, Any]) -> Optional[Instruction]:
         instr = Instruction(opcode='')
-        loc = context.get('current_loc')
+
+        # If instr_data is a dict wrapper that contains its own _loc, prefer that.
+        # Otherwise fall back to context['current_loc'] (set by wrapper nodes).
+        explicit_loc = None
+        if isinstance(instr_data, dict) and '_loc' in instr_data:
+            explicit_loc = instr_data['_loc']
+        elif isinstance(instr_data, list) and instr_data:
+            # sometimes the wrapper is a list containing a dict with _loc
+            first = instr_data[0]
+            if isinstance(first, dict) and '_loc' in first:
+                explicit_loc = first['_loc']
+
+        loc = explicit_loc if explicit_loc is not None else context.get('current_loc')
         if loc:
-            instr.location = loc  # no copy needed; dict is read-only here
+            # copy so multiple AST nodes don't share the same mutable dict
+            instr.location = copy.deepcopy(loc)
         for piece in instr_data:
             if not isinstance(piece, dict):
                 continue
