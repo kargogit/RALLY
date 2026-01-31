@@ -21,6 +21,11 @@ from astNodes import (
 )
 
 
+class TranslationError(Exception):
+    """Raised when the AST extraction encounters a construct it explicitly does not support."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Simple token normalization / parse-tree navigation helper
 # ---------------------------------------------------------------------------
@@ -226,6 +231,13 @@ class ExpressionVisitor:
             return self._visit_additive(actual_expr['additiveExpression'])
         if 'multiplicativeExpression' in actual_expr:
             return self._visit_multiplicative(actual_expr['multiplicativeExpression'])
+
+        # STRICT CHECK: If we are here, the expression contains something we don't know how to handle
+        # e.g., 'wrt', 'seg', 'binaryExpression' with unknown ops
+        keys = list(actual_expr.keys())
+        if keys and keys != ['_loc']:
+            raise TranslationError(f"Unsupported expression construct(s): {keys}")
+
         return None
 
     def _visit_cast(self, cast_expr: List[Any]) -> Any:
@@ -239,6 +251,14 @@ class ExpressionVisitor:
             return {'integer': {'type': val[1], 'value': val[0]}}
         if 'unaryExpression' in expr:
             return self._visit_unary(expr['unaryExpression'])
+
+        # Strict check for cast contents
+        if isinstance(expr, dict):
+            known = {'name', 'register', 'integer', 'unaryExpression', '_loc'}
+            unknown = set(expr.keys()) - known
+            if unknown:
+                raise TranslationError(f"Unsupported cast expression content: {unknown}")
+
         return None
 
     def _visit_unary(self, unary_expr: List[Any]) -> Any:
@@ -361,6 +381,13 @@ class AsmTransformer(ParseTreeVisitor):
             return self._process_directive(line_content['directive'], context)
         if 'pseudoinstruction' in line_content:
             return self._process_pseudoinstruction(line_content['pseudoinstruction'], context)
+
+        # Strict Check: If line contains keys we don't recognize
+        known_keys = {'directive', 'pseudoinstruction', 'instruction', 'label', '_loc'}
+        unknowns = set(line_content.keys()) - known_keys
+        if unknowns:
+            raise TranslationError(f"Unknown line type: {unknowns}")
+
         return None
 
     def visit_block(self, lgroup_data: List[Any], context: Dict[str, Any]) -> Optional[LabelGroup]:
@@ -403,6 +430,14 @@ class AsmTransformer(ParseTreeVisitor):
                     if instr_node:
                         lg.instructions.append(instr_node)
 
+            else:
+                 # Check for unhandled block items
+                known_keys = {'label', 'non_terminator_line', 'terminator_line', '_loc'}
+                unknowns = set(item.keys()) - known_keys
+                if unknowns:
+                     # This often catches things like 'directive' inside a block where only instructions were expected
+                     raise TranslationError(f"Unexpected item in block: {unknowns}")
+
         return lg if lg.instructions else None
 
     def visit_label(self, label_data: List[Any], context: Dict[str, Any]) -> Optional[Label]:
@@ -444,6 +479,12 @@ class AsmTransformer(ParseTreeVisitor):
                 op = self.visit_operand(piece['operand'], context)
                 if op:
                     instr.operands.append(op)
+            elif '_loc' in piece:
+                pass
+            else:
+                 # Check for instruction prefixes or modifiers we don't know
+                 # e.g., 'rep_prefix', 'segment_override'
+                 raise TranslationError(f"Unhandled instruction component: {piece.keys()}")
         return instr
 
     def visit_operand(self, operand_data: List[Any], context: Dict[str, Any]) -> Operand:
@@ -473,6 +514,12 @@ class AsmTransformer(ParseTreeVisitor):
                 string_node = self.registry.transform('string', item['string'])
                 if string_node:
                     op.integer = string_node
+            else:
+                # STRICT CHECK: Unhandled operand keys (e.g. 'segment', 'wrt', complex types)
+                known_keys = {'register', 'size', 'expression', 'integer', 'name', 'string', '_loc'}
+                unknowns = set(item.keys()) - known_keys
+                if unknowns:
+                    raise TranslationError(f"Unhandled operand component: {unknowns}")
         return op
 
     # directives and pseudoinstructions
@@ -494,7 +541,8 @@ class AsmTransformer(ParseTreeVisitor):
             if context.get('current_loc'):
                 decl.location = context['current_loc']
             return decl
-        return None
+        # STRICT CHECK: If we are here, it's a directive we don't support (e.g., 'default', 'extern', 'comp')
+        raise TranslationError(f"Unsupported directive found: '{directive_type}'")
 
     def _process_pseudoinstruction(self, pseudo_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pseudo_dict: Dict[str, Any] = {}
@@ -520,10 +568,17 @@ class AsmTransformer(ParseTreeVisitor):
                 val = self._process_pseudo_value(item['value'])
                 if val:
                     pseudo_values.append(val)
+                else:
+                    # Strict check: item['value'] existed but produced no result
+                    raise TranslationError(f"Unsupported value definition in pseudo-instruction: {item['value']}")
             elif 'integer' in item:
                 imm = self.registry.transform('integer', item['integer'])
                 if imm:
                     pseudo_dict['integer'] = {'type': imm.type, 'value': imm.value}
+            elif '_loc' in item:
+                pass
+            else:
+                 raise TranslationError(f"Unsupported pseudo-instruction key: {item.keys()}")
         if pseudo_values:
             pseudo_dict['values'] = pseudo_values
         return {'pseudo_instruct': pseudo_dict} if pseudo_dict else None
@@ -581,7 +636,13 @@ class AsmTransformer(ParseTreeVisitor):
             return {'string': atom['string'][0][0]} if atom['string'] else None
         if 'expression' in atom:
             return self._process_expression(atom)
-        return None
+        # STRICT CHECK: Handle bare symbols/names inside pseudo values (common in dq/dd)
+        if 'name' in atom:
+             # Just normalize the name and treat as a symbol reference
+             return {'symbol': self.navigator.normalize_token(atom['name'])}
+
+        # If we got here, it's an atom type we don't know (e.g. char constant not in string/int form)
+        raise TranslationError(f"Unsupported pseudo-value atom: {atom.keys()}")
 
     def _process_expression(self, expr_container: Dict[str, Any]) -> Any:
         visitor = ExpressionVisitor(self.navigator)
