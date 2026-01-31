@@ -301,6 +301,18 @@ class AsmTransformer(ParseTreeVisitor):
                     return Immediate(value=int_data[0], type=int_data[1])
             return None
 
+        @self.registry.register('string')
+        def handle_string(data, ctx):
+            if isinstance(data, list) and data:
+                first = data[0]
+                if isinstance(first, (list, tuple)) and len(first) >= 2:
+                    string_val = first[0]
+                    # Handle single-character literals like "'-'"
+                    if len(string_val) == 3 and string_val[0] == "'" and string_val[-1] == "'":
+                        char_val = string_val[1]
+                        return Immediate(value=ord(char_val), type='BYTE')
+            return None
+
         @self.registry.register('label')
         def handle_label(data, ctx):
             return self.visit_label(data, ctx)
@@ -457,6 +469,10 @@ class AsmTransformer(ParseTreeVisitor):
                     op.integer = imm_node
             elif 'name' in item:
                 op.name = self.navigator.normalize_token(item['name'])
+            elif 'string' in item:
+                string_node = self.registry.transform('string', item['string'])
+                if string_node:
+                    op.integer = string_node
         return op
 
     # directives and pseudoinstructions
