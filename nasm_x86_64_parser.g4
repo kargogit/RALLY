@@ -77,7 +77,7 @@ directive
     : bits decimal_integer
     | use16
     | use32
-    | default default_perfix
+    | default default_prefix
     | section section_params
     | absolute (integer | name)
     | (extern | required) extern_params
@@ -115,7 +115,7 @@ default
     : DEFAULT
     ;
 
-default_perfix
+default_prefix
     : REL
     | ABS
     | BND
@@ -572,7 +572,7 @@ opcode
     | MOVSS | ADDSS | MULSS                 // Floating-Point Arithmetic (SSE)
     | CVTTSS2SI                             // Floating-Point to Integer Conversion (SSE)
     | CMP | TEST | SETNE | SETC | SETPE     // Comparison
-    | CMOVNE                                // Conditional move (move if not-equal / ZF == 0)
+    | CMOVE | CMOVNE                        // Conditional move (move if not-equal / ZF == 0)
     | AND | OR | XOR                        // Logical
     | SHL | SHR | SAR                       // Bit shifts
     | CALL | JMP | RET                      // Control flow (if not in terminator_instruction)
@@ -607,9 +607,13 @@ operand
         string
         | float_number
         | integer
-        | LEFT_BRACKET (segment_register COLON)? expression (COMMA expression)* RIGHT_BRACKET
+        | LEFT_BRACKET (segment_register COLON)? rel_prefix? expression (COMMA expression)* RIGHT_BRACKET
     )
     | expression
+    ;
+
+rel_prefix
+    : REL
     ;
 
 register

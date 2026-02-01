@@ -138,7 +138,7 @@ class RipRelativeDetector:
     def _has_rip_or_rel(self, node: Any) -> bool:
         if isinstance(node, dict):
             for k, v in node.items():
-                if k in ('rel', 'rip'):
+                if k in ('rel', 'rip', 'rel_prefix'):
                     return True
                 if self._has_rip_or_rel(v):
                     return True
@@ -164,7 +164,17 @@ class RipRelativeDetector:
     def _extract_from_expression(self, expr_data: Any) -> Optional[object]:
         if not isinstance(expr_data, dict):
             return None
-        # try a few layers similar to original design
+        # Check for 'wrt' key
+        if 'wrt' in expr_data:
+            wrt_expr = expr_data['wrt']
+            if isinstance(wrt_expr, list) and len(wrt_expr) >= 3:
+                # Extract the symbol and the wrt target
+                symbol_part = wrt_expr[0]
+                wrt_target_part = wrt_expr[2]
+                symbol = self.navigator.normalize_token(symbol_part)
+                wrt_target = self.navigator.normalize_token(wrt_target_part)
+                return f"{symbol} wrt {wrt_target}"
+        # Continue with existing logic for other cases
         for key in ('additiveExpression', 'multiplicativeExpression', 'castExpression', 'unaryExpression'):
             if key in expr_data and expr_data[key]:
                 elem = expr_data[key][0]
@@ -188,6 +198,7 @@ class RipRelativeDetector:
             if isinstance(int_data, (list, tuple)):
                 return int_data[0]
         return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -367,8 +378,34 @@ class AsmTransformer(ParseTreeVisitor):
                 ctx_sec: Section = context['current_section']
                 ctx_sec.children.append(result)
             elif isinstance(result, dict) and 'pseudo_instruct' in result:
+                # --- MERGE-CONTINUATION FIX ---
                 ctx_sec: Section = context['current_section']
-                ctx_sec.pseudo_instruct.append(result['pseudo_instruct'])
+                pseudo = result['pseudo_instruct']
+                # only merge when the pseudo has neither 'directive' nor 'name'
+                # (this indicates a continuation of the previous pseudo-instruction)
+                if 'directive' not in pseudo and 'name' not in pseudo and ctx_sec.pseudo_instruct:
+                    last = ctx_sec.pseudo_instruct[-1]
+                    # If current has a 'dx' and last doesn't, adopt it; otherwise keep last's dx.
+                    if 'dx' in pseudo and 'dx' not in last:
+                        last['dx'] = pseudo['dx']
+                    # Merge 'values' arrays
+                    if 'values' in pseudo:
+                        last_values = last.get('values', [])
+                        last_values.extend(pseudo['values'])
+                        last['values'] = last_values
+                    # Merge 'params' if present (some pseudo-instructions may carry params)
+                    if 'params' in pseudo:
+                        last_params = last.get('params', [])
+                        last_params.extend(pseudo['params'])
+                        last['params'] = last_params
+                    # Merge other small fields conservatively (e.g., integer)
+                    for k in ('integer', 'equ', 'resx'):
+                        if k in pseudo and k not in last:
+                            last[k] = pseudo[k]
+
+                else:
+                    # normal case: a standalone pseudo-instruction with a name (or no previous)
+                    ctx_sec.pseudo_instruct.append(pseudo)
 
         return prog
 
@@ -516,18 +553,49 @@ class AsmTransformer(ParseTreeVisitor):
                     op.integer = string_node
             else:
                 # STRICT CHECK: Unhandled operand keys (e.g. 'segment', 'wrt', complex types)
-                known_keys = {'register', 'size', 'expression', 'integer', 'name', 'string', '_loc'}
+                known_keys = {'register', 'size', 'expression', 'integer', 'name', 'string', '_loc', 'rel_prefix'}
                 unknowns = set(item.keys()) - known_keys
                 if unknowns:
                     raise TranslationError(f"Unhandled operand component: {unknowns}")
         return op
 
-    # directives and pseudoinstructions
     def _process_directive(self, directive_data: List[Any], context: Dict[str, Any]) -> Optional[object]:
-        if not directive_data or len(directive_data) < 2:
+        """
+        Robust directive handler.
+        """
+        if not directive_data:
             return None
-        directive_type = directive_data[0]
-        if 'section' in directive_type:
+
+        # Helper: extract a normalized token from a possibly-nested value
+        def _extract_token(val: Any) -> Optional[str]:
+            if val is None:
+                return None
+            if isinstance(val, (list, tuple)):
+                if not val:
+                    return None
+                first = val[0]
+                if isinstance(first, (list, tuple)) and first:
+                    return first[0]
+                return self.navigator.normalize_token(val)
+            if isinstance(val, dict):
+                for vv in val.values():
+                    tok = _extract_token(vv)
+                    if tok is not None:
+                        return tok
+            return self.navigator.normalize_token(val)
+
+        # Determine directive name
+        first = directive_data[0]
+        if isinstance(first, dict):
+            try:
+                directive_name = next(iter(first.keys()))
+            except StopIteration:
+                directive_name = self.navigator.normalize_token(first)
+        else:
+            directive_name = self.navigator.normalize_token(first)
+
+        # Special built-in handling
+        if directive_name == 'section':
             name = self._extract_section_name(directive_data)
             if name == '.text':
                 return self.text_section
@@ -535,14 +603,74 @@ class AsmTransformer(ParseTreeVisitor):
             if context.get('current_loc'):
                 new_section.location = context['current_loc']
             return new_section
-        if 'global' in directive_type:
+
+        if directive_name == 'global':
             name = self._extract_global_name(directive_data)
             decl = GlobalDecl(name=name)
             if context.get('current_loc'):
                 decl.location = context['current_loc']
             return decl
-        # STRICT CHECK: If we are here, it's a directive we don't support (e.g., 'default', 'extern', 'comp')
-        raise TranslationError(f"Unsupported directive found: '{directive_type}'")
+
+        # === NEW: Special handling for multi-symbol extern ===
+        if directive_name == 'extern':
+            params: List[str] = []
+
+            def collect_names(node: Any) -> None:
+                if isinstance(node, list):
+                    for elem in node:
+                        if isinstance(elem, dict):
+                            if 'name' in elem:
+                                name = self.navigator.normalize_token(elem['name'])
+                                if name:
+                                    params.append(name)
+                            elif 'extern_params' in elem:
+                                collect_names(elem['extern_params'])
+                elif isinstance(node, dict):
+                    if 'name' in node:
+                        name = self.navigator.normalize_token(node['name'])
+                        if name:
+                            params.append(name)
+                    elif 'extern_params' in node:
+                        collect_names(node['extern_params'])
+
+            # The parameter list is in directive_data[1]['extern_params'] (if present)
+            if len(directive_data) >= 2:
+                container = directive_data[1]
+                if isinstance(container, dict) and 'extern_params' in container:
+                    collect_names(container['extern_params'])
+
+            pseudo = {'directive': 'extern'}
+            if params:
+                pseudo['params'] = params
+            return {'pseudo_instruct': pseudo}
+
+        # === Generic fallback for everything else (default rel, align, etc.) ===
+        params: List[str] = []
+        seen = set()
+
+        def add_param(tok: Optional[str]) -> None:
+            if tok is None:
+                return
+            if tok not in seen:
+                seen.add(tok)
+                params.append(tok)
+
+        # Extract tokens once per item (avoid double-extraction)
+        for item in directive_data[1:]:
+            tok = _extract_token(item)
+            add_param(tok)
+
+        # If no params found yet, try pulling from the directive keyword node itself
+        if not params and isinstance(first, dict):
+            for v in first.values():
+                tok = _extract_token(v)
+                add_param(tok)
+
+        pseudo = {'directive': directive_name}
+        if params:
+            pseudo['params'] = params
+
+        return {'pseudo_instruct': pseudo}
 
     def _process_pseudoinstruction(self, pseudo_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         pseudo_dict: Dict[str, Any] = {}
