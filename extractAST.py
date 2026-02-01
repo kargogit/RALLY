@@ -259,7 +259,11 @@ class ExpressionVisitor:
             return {'register': self.navigator.normalize_token(expr['register']).upper()}
         if 'integer' in expr:
             val = expr['integer'][0]
-            return {'integer': {'type': val[1], 'value': val[0]}}
+            # val typically like (value, type) and may include ascii as a 3rd element
+            int_dict = {'type': val[1], 'value': val[0]}
+            if len(val) >= 3:
+                int_dict['ascii'] = val[2]
+            return {'integer': int_dict}
         if 'unaryExpression' in expr:
             return self._visit_unary(expr['unaryExpression'])
 
@@ -329,7 +333,9 @@ class AsmTransformer(ParseTreeVisitor):
             if isinstance(data, list) and data:
                 int_data = data[0]
                 if isinstance(int_data, (list, tuple)) and len(int_data) >= 2:
-                    return Immediate(value=int_data[0], type=int_data[1])
+                    # int_data is typically (value, type) but may carry a 3rd element for ascii
+                    ascii_ch = int_data[2] if len(int_data) >= 3 else None
+                    return Immediate(value=int_data[0], type=int_data[1], ascii=ascii_ch)
             return None
 
         @self.registry.register('string')
@@ -341,7 +347,7 @@ class AsmTransformer(ParseTreeVisitor):
                     # Handle single-character literals like "'-'"
                     if len(string_val) == 3 and string_val[0] == "'" and string_val[-1] == "'":
                         char_val = string_val[1]
-                        return Immediate(value=ord(char_val), type='BYTE')
+                        return Immediate(value=ord(char_val), type='BYTE', ascii=char_val)
             return None
 
         @self.registry.register('label')
@@ -545,8 +551,10 @@ class AsmTransformer(ParseTreeVisitor):
                 expr_res = self._process_expression(item)
                 if isinstance(expr_res, dict) and 'integer' in expr_res and len(expr_res) == 1:
                     int_rec = expr_res['integer']
-                    # int_rec may have been normalized to an int or a string; keep the value as-is.
-                    op.integer = Immediate(value=int_rec['value'], type=int_rec['type'])
+                    # propagate ascii if present in the expression result
+                    op.integer = Immediate(value=int_rec['value'],
+                                        type=int_rec['type'],
+                                        ascii=int_rec.get('ascii'))
                 else:
                     # Non-trivial expression: keep as expression field
                     op.expression = expr_res
@@ -712,7 +720,10 @@ class AsmTransformer(ParseTreeVisitor):
             elif 'integer' in item:
                 imm = self.registry.transform('integer', item['integer'])
                 if imm:
-                    pseudo_dict['integer'] = {'type': imm.type, 'value': imm.value}
+                    int_entry = {'type': imm.type, 'value': imm.value}
+                    if getattr(imm, 'ascii', None) is not None:
+                        int_entry['ascii'] = imm.ascii
+                    pseudo_dict['integer'] = int_entry
             elif '_loc' in item:
                 pass
             else:
@@ -765,7 +776,12 @@ class AsmTransformer(ParseTreeVisitor):
         atom = value_data[0].get('atom', [{}])[0]
         if 'integer' in atom:
             imm = self.registry.transform('integer', atom['integer'])
-            return {'integer': {'type': imm.type, 'value': imm.value}} if imm else None
+            if not imm:
+                return None
+            int_entry = {'type': imm.type, 'value': imm.value}
+            if getattr(imm, 'ascii', None) is not None:
+                int_entry['ascii'] = imm.ascii
+            return {'integer': int_entry}
         if 'float_number' in atom:
             float_data = atom['float_number'][0]
             if float_data and len(float_data) >= 2:

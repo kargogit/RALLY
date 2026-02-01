@@ -102,6 +102,7 @@ class Memory(ASTNode):
 class Immediate(ASTNode):
     value: Union[int, str]
     type: str
+    ascii: Optional[str] = None
 
 
 @dataclass
@@ -140,7 +141,10 @@ def _serialize_operand(op: Operand) -> Dict[str, Any]:
     if op.expression is not None:
         out['expression'] = op.expression
     if op.integer is not None:
-        out['integer'] = {'value': op.integer.value, 'type': op.integer.type}
+        int_obj = {'value': op.integer.value, 'type': op.integer.type}
+        if getattr(op.integer, 'ascii', None) is not None:
+            int_obj['ascii'] = op.integer.ascii
+        out['integer'] = int_obj
     if op.name is not None:
         out['name'] = op.name
     if op.memory is not None:
@@ -288,7 +292,9 @@ def _deserialize_operand(op_dict: Dict[str, Any]) -> Operand:
         op.expression = op_dict['expression']
     if 'integer' in op_dict:
         int_dict = op_dict['integer']
-        op.integer = Immediate(value=int_dict['value'], type=int_dict['type'])
+        op.integer = Immediate(value=int_dict['value'],
+                               type=int_dict['type'],
+                               ascii=int_dict.get('ascii'))
     if 'name' in op_dict:
         op.name = op_dict['name']
     if 'memory' in op_dict:
