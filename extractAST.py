@@ -540,7 +540,16 @@ class AsmTransformer(ParseTreeVisitor):
             elif 'size' in item:
                 op.size = self.navigator.normalize_token(item['size']).upper()
             elif 'expression' in item:
-                op.expression = self._process_expression(item)
+                # Evaluate expression; if it reduces to a plain integer immediate,
+                # store it in op.integer for consistency with direct 'integer' operands.
+                expr_res = self._process_expression(item)
+                if isinstance(expr_res, dict) and 'integer' in expr_res and len(expr_res) == 1:
+                    int_rec = expr_res['integer']
+                    # int_rec may have been normalized to an int or a string; keep the value as-is.
+                    op.integer = Immediate(value=int_rec['value'], type=int_rec['type'])
+                else:
+                    # Non-trivial expression: keep as expression field
+                    op.expression = expr_res
             elif 'integer' in item:
                 imm_node = self.registry.transform('integer', item['integer'])
                 if imm_node:
@@ -558,6 +567,7 @@ class AsmTransformer(ParseTreeVisitor):
                 if unknowns:
                     raise TranslationError(f"Unhandled operand component: {unknowns}")
         return op
+
 
     def _process_directive(self, directive_data: List[Any], context: Dict[str, Any]) -> Optional[object]:
         """
