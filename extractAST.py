@@ -362,6 +362,65 @@ class AsmTransformer(ParseTreeVisitor):
         def handle_instruction(data, ctx):
             return self.visit_instruction(data, ctx)
 
+
+    def _convert_expression_to_memory(self, expr: Any) -> Optional[Memory]:
+        """
+        Convert simple address expressions (common in memory operands) to Memory nodes.
+        Used only for non-LEA instructions that perform actual memory access.
+        Handles:
+        - Single register: {"register": "RSI"} → base="RSI"
+        - Register + displacement: additive [reg, int] → base=reg, displacement=int
+        - Symbolic name (under default rel): "sym" → base="RIP", displacement="sym"
+        Returns None for complex cases (e.g., two registers without scale) → keeps expression.
+        """
+        if expr is None:
+            return None
+
+        mem = Memory()
+
+        # Symbolic name → RIP-relative (valid under default rel)
+        if isinstance(expr, str):
+            mem.base = "RIP"
+            mem.displacement = expr
+            return mem
+
+        if not isinstance(expr, dict):
+            return None
+
+        # Single register
+        if "register" in expr and len(expr) == 1:
+            mem.base = expr["register"]
+            return mem
+
+        # Additive expression: expect exactly two parts (reg + disp or disp + reg)
+        if "additive" in expr and isinstance(expr["additive"], list) and len(expr["additive"]) == 2:
+            addends = expr["additive"]
+            reg = None
+            disp = None
+            for part in addends:
+                if isinstance(part, dict):
+                    if "register" in part:
+                        if reg is not None:
+                            return None  # two registers → too complex, keep as expression
+                        reg = part["register"]
+                    elif "integer" in part:
+                        if disp is not None:
+                            return None
+                        disp_val = part["integer"]["value"]
+                        try:
+                            disp = int(disp_val, 0)  # handles hex if needed
+                        except ValueError:
+                            disp = disp_val
+            if reg:
+                mem.base = reg
+                if disp is not None:
+                    mem.displacement = disp
+                return mem
+
+        # Anything else (e.g., reg + reg, scaled index, complex expr) → keep as expression
+        return None
+
+
     # Top-level program builder
     def visit_program(self, program_data: List[Any], context: Dict[str, Any]) -> Program:
         prog = Program(sections=[self.text_section])
@@ -525,10 +584,18 @@ class AsmTransformer(ParseTreeVisitor):
             elif '_loc' in piece:
                 pass
             else:
-                 # Check for instruction prefixes or modifiers we don't know
-                 # e.g., 'rep_prefix', 'segment_override'
-                 raise TranslationError(f"Unhandled instruction component: {piece.keys()}")
-        return instr
+                raise TranslationError(f"Unhandled instruction component: {piece.keys()}")
+    # === Post-process memory operands for actual memory-accessing instructions ===
+        if instr.opcode != "LEA":
+            for op in instr.operands:
+                if op.expression is not None and op.memory is None:
+                    converted = self._convert_expression_to_memory(op.expression)
+                    if converted is not None:
+                        op.memory = converted
+                        op.expression = None
+                    # If not converted, leave as expression (safety for unexpected cases)
+
+        return instr if instr.opcode else None
 
     def visit_operand(self, operand_data: List[Any], context: Dict[str, Any]) -> Operand:
         # detect rip-relative first
