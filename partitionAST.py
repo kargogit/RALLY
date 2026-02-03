@@ -10,6 +10,8 @@ from typing import List, Dict, Any, Optional, Tuple, Set
 import itertools
 import uuid
 import dataclasses
+import re
+from typing import Iterable
 
 # Import dataclasses/types from astNodes.py (must be in same PYTHONPATH)
 from astNodes import (
@@ -24,6 +26,8 @@ from astNodes import (
     legacy_program_dict_to_ast
 )
 
+_LABEL_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
 # Config: which section names are considered executable (partitioned)
 DEFAULT_EXECUTABLE_SECTIONS = {'.text'}
 
@@ -31,6 +35,99 @@ DEFAULT_EXECUTABLE_SECTIONS = {'.text'}
 # -------------------------
 # Helper functions
 # -------------------------
+def _extract_label_names_from_obj(obj, found: Set[str]) -> None:
+    """
+    Recursively inspect obj to find label-like strings and .name attributes.
+    Adds candidates to `found`. Conservative: only accepts strings that match _LABEL_RE.
+    Works for dicts, lists/tuples, dataclasses, and generic objects with attributes.
+    """
+    if obj is None:
+        return
+
+    # If it's already a known label-name string
+    if isinstance(obj, str):
+        if _LABEL_RE.match(obj):
+            found.add(obj)
+        return
+
+    # If it's a dataclass, convert to dict to walk fields (safe)
+    if dataclasses.is_dataclass(obj):
+        try:
+            od = dataclasses.asdict(obj)
+        except Exception:
+            # fallback to attribute iteration
+            od = {k: getattr(obj, k) for k in dir(obj) if not k.startswith('_')}
+        _extract_label_names_from_obj(od, found)
+        return
+
+    # If it's a dict: walk values
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _extract_label_names_from_obj(v, found)
+        return
+
+    # If it's a list/tuple/set: iterate elements
+    if isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            _extract_label_names_from_obj(v, found)
+        return
+
+    # If it has a .name attribute that's a string, collect it
+    name = getattr(obj, 'name', None)
+    if isinstance(name, str) and _LABEL_RE.match(name):
+        found.add(name)
+
+    # If it has an 'operands' attribute (Instruction-like or data directive),
+    # inspect it (covers cases like Instruction.operands or DataDirective.items).
+    operands = getattr(obj, 'operands', None)
+    if operands is not None:
+        _extract_label_names_from_obj(operands, found)
+
+    # Also try common names that may contain label refs (e.g., 'value', 'items', 'args')
+    for attr in ('value', 'values', 'items', 'args', 'operands', 'displacement', 'label'):
+        if hasattr(obj, attr):
+            _extract_label_names_from_obj(getattr(obj, attr), found)
+
+    # As a last resort, inspect simple public attributes (avoid callables, dunder)
+    # but do this sparingly to avoid huge recursion/side effects.
+    try:
+        for k in dir(obj):
+            if k.startswith('_'):
+                continue
+            # skip methods and descriptors
+            v = getattr(obj, k)
+            if callable(v):
+                continue
+            # small heuristic: only inspect simple attributes (str, dict, list, dataclass)
+            if isinstance(v, (str, dict, list, tuple, set)) or dataclasses.is_dataclass(v):
+                _extract_label_names_from_obj(v, found)
+    except Exception:
+        # swallow inspection errors (robust best-effort)
+        pass
+
+
+def _collect_label_references_from_sections(sections: Iterable[Section]) -> Set[str]:
+    """
+    Scan all sections' children for embedded label references (e.g. `dq constructor_stub`)
+    and return a set of referenced label names.
+    """
+    found: Set[str] = set()
+    for sec in sections:
+        # Section has children which may be LabelGroup, Label, Instruction, or other nodes.
+        for child in getattr(sec, 'children', []) or []:
+            # If child is a LabelGroup, inspect its .instructions field (or equivalent)
+            if isinstance(child, LabelGroup):
+                for it in getattr(child, 'instructions', []) or []:
+                    _extract_label_names_from_obj(it, found)
+            else:
+                # For any other child node (could be a 'function-node' etc), inspect generically
+                _extract_label_names_from_obj(child, found)
+    return found
+
+
+
+
+
 def _is_executable_section(section: Section) -> bool:
     return section.name in DEFAULT_EXECUTABLE_SECTIONS
 
@@ -57,6 +154,15 @@ def _is_return(opcode: str) -> bool:
 def _is_call(opcode: str) -> bool:
     o = _opcode_family(opcode)
     return o == 'call' or o.startswith('call')
+
+
+def _is_loop(opcode: str) -> bool:
+    """
+    Detect loop-family instructions (loop, loope/loopz, loopne/loopnz).
+    Conservative: treat any opcode that starts with 'loop' as a loop-branch.
+    """
+    o = _opcode_family(opcode)
+    return o.startswith('loop')
 
 
 def _is_branch(opcode: str) -> bool:
@@ -225,10 +331,14 @@ def _flatten_section_labelgroups(section: Section) -> List[Tuple[str, Any]]:
 
 def _identify_function_entry_labels(
     linear_stream: List[Tuple[str, Any]],
-    program_globals: List[str]
+    program_globals: List[str],
+    program_sections: Optional[Iterable[Section]] = None
 ) -> Set[str]:
     """
-    Heuristic: function entry labels are names in program_globals or call targets.
+    Heuristic: function entry labels come from:
+      - program globals (explicit)
+      - call targets found in the linear_stream (call instructions)
+      - label references embedded in data sections (.init_array/.fini_array etc)
     """
     globals_set = set(program_globals or [])
     call_targets: Set[str] = set()
@@ -242,7 +352,14 @@ def _identify_function_entry_labels(
         node.name for kind, node in linear_stream if kind == 'label' and isinstance(node, Label)
     }
 
-    candidates = (globals_set | call_targets) & label_names_in_stream
+    data_references: Set[str] = set()
+    if program_sections is not None:
+        try:
+            data_references = _collect_label_references_from_sections(program_sections)
+        except Exception:
+            data_references = set()
+
+    candidates = (globals_set | call_targets | data_references) & label_names_in_stream
     return candidates
 
 
@@ -335,7 +452,7 @@ def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_glo
         if _is_return(op) or _is_unconditional_jump(op):
             continue
 
-        if _is_branch(op) or _is_call(op):
+        if _is_branch(op) or _is_loop(op):
             next_idx = i + 1
             if next_idx < len(instrs):
                 leaders.add(next_idx)
@@ -412,7 +529,7 @@ def partition_program_into_functions_and_basic_blocks(program: Program) -> Progr
             continue
 
         linear_stream = _flatten_section_labelgroups(sec)
-        entry_candidates = _identify_function_entry_labels(linear_stream, program.globals or [])
+        entry_candidates = _identify_function_entry_labels(linear_stream, program.globals or [], program.sections)
         segments = _split_linear_stream_into_function_segments(linear_stream, entry_candidates)
 
         if not segments and linear_stream:
