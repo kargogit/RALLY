@@ -398,7 +398,7 @@ def _split_linear_stream_into_function_segments(
     return segments
 
 
-def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_globals: List[str]) -> Optional[Function]:
+def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_globals: List[str], bb_id_counter: itertools.count) -> Optional[Function]:
     """
     Partition a function segment into BasicBlocks and return a Function.
     Correctly calculates source location ranges for blocks and the function.
@@ -473,7 +473,7 @@ def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_glo
             continue
 
         bb = BasicBlock(instructions=block_insts)
-        bb.id = f"bb_{uuid.uuid4().hex[:8]}"
+        bb.id = f"bb_{next(bb_id_counter)}"
 
         # Attach start label (prefer first one at this index)
         label_list = labels_by_index.get(start_idx)
@@ -524,6 +524,7 @@ def partition_program_into_functions_and_basic_blocks(program: Program) -> Progr
     """
     Main entry: mutate `program` in-place (and also return it) performing Step 3.
     """
+    bb_id_counter = itertools.count()
     for sec in program.sections:
         if not _is_executable_section(sec):
             continue
@@ -537,7 +538,7 @@ def partition_program_into_functions_and_basic_blocks(program: Program) -> Progr
 
         new_children: List[Any] = []
         for seg in segments:
-            func = _partition_segment_into_function(seg, program.globals or [])
+            func = _partition_segment_into_function(seg, program.globals or [], bb_id_counter)
             if func is not None:
                 new_children.append(func)
             else:
