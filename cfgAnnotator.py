@@ -163,7 +163,23 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                 last_entry = ins_entries[-1]
                 last_instr = last_entry['instruction'] if 'instruction' in last_entry else last_entry
 
-            bb['terminator'] = last_instr['id'] if last_instr else None
+            def is_terminator_instr(instr: Dict[str, Any]) -> bool:
+                """Return True if instr actually transfers control / is a terminator.
+                Conservative: checks jump/return/call/loop families and also any
+                pre-populated target_blocks on the instruction."""
+                if not instr:
+                    return False
+                opc = instr.get('opcode', '').upper()
+                # explicit control-flow opcode families
+                if is_unconditional(opc) or is_conditional(opc) or is_return(opc) or is_call(opc) or is_loop(opc):
+                    return True
+                # sometimes upstream parsing attaches target_blocks when it knows the
+                # instruction targets a label even if the opcode is unusual:
+                if instr.get('target_blocks'):
+                    return True
+                return False
+
+            bb['terminator'] = last_instr['id'] if last_instr and is_terminator_instr(last_instr) else None
             bb['successors'] = []
             bb['predecessors'] = bb.get('predecessors', []) or []
 
