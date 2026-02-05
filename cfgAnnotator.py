@@ -336,9 +336,8 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                             if sbl in program_symbol_table:
                                 program_symbol_table[sbl].setdefault('scoped_to', anchor)
 
-    program.setdefault('enhancements', {})
-    program['enhancements']['symbol_table'] = program_symbol_table
-    program['enhancements']['id_maps'] = {
+    program['symbol_table'] = program_symbol_table
+    program['id_maps'] = {
         'functions': {fid: {'section': f.get('parent'), 'entry_label': f.get('entry_label')} for fid, f in func_map.items()},
         'basic_blocks': {bbid: {'function_id': fid, 'start_label': bb.get('start_label')} for bbid, (fid, bb) in bb_map.items()},
     }
