@@ -1,10 +1,9 @@
-"""
-cfgAnnotator.py
-Enhance dictionary-based AST with navigation, CFG links and symbol table.
-Reads a legacy-program dict JSON from stdin (Step 3 output), and writes an
-enhanced JSON to stdout. Enhancements are JSON-safe identifiers (no Python
-object references / cycles), suitable for downstream passes.
-"""
+## cfgAnnotator.py
+# Enhance dictionary-based AST with navigation, CFG links and symbol table.
+# Reads a legacy-program dict JSON from stdin (Step 3 output), and writes an
+# enhanced JSON to stdout. Enhancements are JSON-safe identifiers (no Python
+# object references / cycles), suitable for downstream passes.
+
 import sys
 import json
 from typing import Dict, List, Tuple, Any, Optional, Iterable
@@ -54,42 +53,43 @@ def is_loop(opcode: str) -> bool:
 # ---- Main enhancement pass -----------------------------------------------
 def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
     program = json.loads(json.dumps(legacy))  # deep copy
-
     fid_ctr = [0]
     bb_ctr = [0]
     instr_ctr = [0]
-
     func_map: Dict[str, Dict[str, Any]] = {}
-    bb_map: Dict[str, Tuple[str, Dict[str, Any]]] = {}   # bb_id -> (func_id, bb dict)
+    bb_map: Dict[str, Tuple[str, Dict[str, Any]]] = {}  # bb_id -> (func_id, bb dict)
     instr_map: Dict[str, Tuple[str, Dict[str, Any]]] = {}  # instr_id -> (bb_id, instr dict)
     label_def_map: Dict[str, Dict[str, Any]] = {}
     data_symbol_map: Dict[str, Dict[str, Any]] = {}
-
+    extern_symbols: set[str] = set()
     globals_list = find_globals(program)
     global_set = set(globals_list or [])
-
     section_list = []
+
     for sec in iter_program_sections(program):
         section_list.append(sec)
         for pi in sec.get('pseudo_instruct', []):
-            if isinstance(pi, dict) and 'name' in pi:
-                name = pi['name']
-                data_symbol_map[name] = {'kind': 'data', 'section': sec.get('name'), 'def': pi}
+            if isinstance(pi, dict):
+                if 'name' in pi:
+                    name = pi['name']
+                    data_symbol_map[name] = {'kind': 'data', 'section': sec.get('name'), 'def': pi}
+                elif pi.get('directive') == 'extern':
+                    params = pi.get('params', [])
+                    if isinstance(params, list):
+                        extern_symbols.update(params)
 
     for sec in section_list:
         children = sec.get('children', [])
         new_children = []
         section_name = sec.get('name')
-
         for child in children:
             if 'function' in child:
                 func = child['function']
                 entry_label = func.get('entry_label')
                 func_id = f"func:{entry_label}" if entry_label else unique_id("func_", fid_ctr)
                 func['id'] = func_id
-                func['parent'] = section_name   # ← parent as string ID (section name)
+                func['parent'] = section_name
                 func_map[func_id] = func
-
                 bbs = func.get('basic_blocks', [])
                 for bb in bbs:
                     if 'id' not in bb:
@@ -100,8 +100,7 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                             'kind': 'label', 'defined_in': 'code', 'bb_id': bb_id, 'section': section_name
                         }
                     bb_map[bb_id] = (func_id, bb)
-                    bb['parent'] = func_id      # ← parent as string ID (function id)
-
+                    bb['parent'] = func_id
                     ins_entries = bb.get('instructions', [])
                     for it in ins_entries:
                         instr_dict = (it['instruction'] if isinstance(it, dict) and 'instruction' in it else it)
@@ -109,36 +108,23 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                             instr_dict['id'] = unique_id("instr_", instr_ctr)
                         instr_id = instr_dict['id']
                         instr_map[instr_id] = (bb_id, instr_dict)
-                        instr_dict['parent'] = bb_id   # ← parent as string ID (basic block id)
-
+                        instr_dict['parent'] = bb_id
                         # annotate rip_relative and normalize GOT-style displacements
                         for op in instr_dict.get('operands', []):
                             if isinstance(op, dict) and 'memory' in op:
                                 mem = op['memory']
                                 if isinstance(mem, dict) and mem.get('base', '').upper() == 'RIP':
-                                    # mark rip-relative
                                     op['rip_relative'] = True
-                                    # default (explicit) via_got False unless we detect a GOT wrt hint
                                     op['via_got'] = False
-
-                                    # normalize displacement strings like:
-                                    #   "stderr wrt ..got"  -> "stderr", symbol_ref="stderr", via_got=True
                                     disp = mem.get('displacement')
                                     if isinstance(disp, str):
                                         low = disp.lower()
-                                        # simple, robust detection: require both 'wrt' and 'got' (case-insensitive)
-                                        if 'wrt' in disp and 'got' in low:
-                                            # symbol name is the part before 'wrt'
+                                        if 'wrt' in low and 'got' in low:
                                             sym = disp.split('wrt', 1)[0].strip()
                                             if sym:
                                                 mem['displacement'] = sym
-                                                # set symbol_ref for downstream passes (string form)
-                                                op['symbol_ref'] = sym
                                                 op['via_got'] = True
-
-
                 new_children.append(child)
-
             elif 'lgroup' in child:
                 lg = child['lgroup']
                 for it in lg:
@@ -173,7 +159,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
         bbs = func.get('basic_blocks', [])
         ordered_bb_ids = [bb['id'] for bb in bbs]
         bb_index = {bb_id: idx for idx, bb_id in enumerate(ordered_bb_ids)}
-
         for idx, bb in enumerate(bbs):
             bb_id = bb['id']
             ins_entries = bb.get('instructions', [])
@@ -183,17 +168,11 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                 last_instr = last_entry['instruction'] if 'instruction' in last_entry else last_entry
 
             def is_terminator_instr(instr: Dict[str, Any]) -> bool:
-                """Return True if instr actually transfers control / is a terminator.
-                Conservative: checks jump/return/call/loop families and also any
-                pre-populated target_blocks on the instruction."""
                 if not instr:
                     return False
                 opc = instr.get('opcode', '').upper()
-                # explicit control-flow opcode families
                 if is_unconditional(opc) or is_conditional(opc) or is_return(opc) or is_call(opc) or is_loop(opc):
                     return True
-                # sometimes upstream parsing attaches target_blocks when it knows the
-                # instruction targets a label even if the opcode is unusual:
                 if instr.get('target_blocks'):
                     return True
                 return False
@@ -201,7 +180,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
             bb['terminator'] = last_instr['id'] if last_instr and is_terminator_instr(last_instr) else None
             bb['successors'] = []
             bb['predecessors'] = bb.get('predecessors', []) or []
-
             if not last_instr:
                 if idx + 1 < len(ordered_bb_ids):
                     bb['successors'].append(ordered_bb_ids[idx + 1])
@@ -220,13 +198,11 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
 
             targets: List[str] = []
             direct_target_found = False
-
             if is_unconditional(opcode) and last_instr.get('operands'):
                 t = resolve_operand_target(last_instr['operands'][0])
                 if t:
                     targets.append(t)
                     direct_target_found = True
-
             elif (is_conditional(opcode) or is_loop(opcode)) and last_instr.get('operands'):
                 t = resolve_operand_target(last_instr['operands'][0])
                 if t:
@@ -234,10 +210,8 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                     direct_target_found = True
                 if idx + 1 < len(ordered_bb_ids):
                     targets.append(ordered_bb_ids[idx + 1])
-
             elif is_return(opcode):
                 targets = []
-
             elif is_call(opcode):
                 if idx + 1 < len(ordered_bb_ids):
                     targets.append(ordered_bb_ids[idx + 1])
@@ -245,7 +219,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                     t = resolve_operand_target(last_instr['operands'][0])
                     if t:
                         last_instr['target_blocks'] = [t]
-
             else:
                 if idx + 1 < len(ordered_bb_ids):
                     targets.append(ordered_bb_ids[idx + 1])
@@ -271,25 +244,38 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                     if bb['id'] not in succ_bb['predecessors']:
                         succ_bb['predecessors'].append(bb['id'])
 
-    # Operand symbol_ref and rip_relative (already partially done above)
+    # Unified symbol catalog (defined + external)
     symbol_catalog: Dict[str, Dict[str, Any]] = {}
     for name, info in data_symbol_map.items():
         symbol_catalog[name] = {'kind': 'data', 'def': info, 'visibility': 'global' if name in global_set else 'local'}
     for label_name, info in label_def_map.items():
         kind = 'function' if info.get('bb_id') and (label_name in global_set or any(f.get('entry_label') == label_name for f in func_map.values())) else 'label'
         symbol_catalog[label_name] = {'kind': kind, 'def': info, 'visibility': 'global' if label_name in global_set else 'local'}
+    for ext in extern_symbols:
+        symbol_catalog[ext] = {'kind': 'external', 'visibility': 'global'}
 
+    # Centralized operand symbol_ref annotation + external kind inference
     for instr_id, (bbid, instr) in instr_map.items():
+        opc = instr.get('opcode', '').upper()
+        is_call_instr = is_call(opc)
         for op in instr.get('operands', []):
+            sym = None
+            usage_kind = None
             if 'name' in op and op['name'] in symbol_catalog:
-                op['symbol_ref'] = op['name']
+                sym = op['name']
+                op['symbol_ref'] = sym
+                if is_call_instr:
+                    usage_kind = 'function'
             if 'memory' in op and isinstance(op['memory'], dict):
                 disp = op['memory'].get('displacement')
                 if isinstance(disp, str) and disp in symbol_catalog:
-                    # If via_got was not explicitly detected earlier, make it explicit False
+                    sym = disp
+                    op['symbol_ref'] = disp
                     if 'via_got' not in op:
                         op['via_got'] = False
-                    op['symbol_ref'] = disp
+                    usage_kind = 'data'
+            if sym and symbol_catalog[sym]['kind'] == 'external' and usage_kind:
+                symbol_catalog[sym]['kind'] = usage_kind
 
     # Program-level symbol table
     program_symbol_table: Dict[str, Any] = {}
@@ -300,10 +286,9 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                 'kind': 'function',
                 'definition': {'func_id': func_id, 'entry_bb': func.get('basic_blocks', [{}])[0].get('id')},
                 'visibility': 'global' if entry in global_set else 'local',
-                'section': func.get('parent'),   # ← use parent (section name)
+                'section': func.get('parent'),
                 'location': func.get('location'),
             }
-
     for name, info in label_def_map.items():
         rec = {'kind': info.get('kind', 'label'), 'visibility': 'global' if name in global_set else 'local'}
         if 'bb_id' in info:
@@ -311,13 +296,18 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
         else:
             rec['definition'] = {'defined_in': info.get('defined_in'), 'section': info.get('section'), 'raw': info.get('definition')}
         program_symbol_table[name] = rec
-
     for name, info in data_symbol_map.items():
         program_symbol_table.setdefault(name, {
             'kind': 'data',
             'definition': {'section': info.get('section'), 'raw': info.get('def')},
             'visibility': 'global' if name in global_set else 'local'
         })
+    for ext in extern_symbols:
+        cat_kind = symbol_catalog.get(ext, {}).get('kind', 'external')
+        program_symbol_table[ext] = {
+            'kind': cat_kind,
+            'visibility': 'global'
+        }
 
     # Local label scoping
     for sec in section_list:
@@ -352,7 +342,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
         'functions': {fid: {'section': f.get('parent'), 'entry_label': f.get('entry_label')} for fid, f in func_map.items()},
         'basic_blocks': {bbid: {'function_id': fid, 'start_label': bb.get('start_label')} for bbid, (fid, bb) in bb_map.items()},
     }
-
     return program
 
 # ---- CLI entrypoint -----------------------------------------------------
@@ -366,7 +355,6 @@ def main():
     except json.JSONDecodeError as jde:
         eprint("Failed to parse JSON from stdin:", jde)
         sys.exit(3)
-
     try:
         enhanced = build_enhanced_program(obj)
         json.dump(enhanced, sys.stdout, indent=2, sort_keys=False)
