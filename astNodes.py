@@ -106,7 +106,7 @@ class Operand(ASTNode):
     name: Optional[str] = None
     symbol_ref: Optional['Label'] = None
     rip_relative: bool = False
-
+    via_got: bool = False
 
 @dataclass
 class Memory(ASTNode):
@@ -180,6 +180,8 @@ def _serialize_operand(op: Operand, include_enhancements: bool = False) -> Dict[
         if op.symbol_ref:
             out['symbol_ref'] = op.symbol_ref.name  # Use name for reference
         out['rip_relative'] = op.rip_relative
+        # expose via_got explicitly (bool)
+        out['via_got'] = getattr(op, 'via_got', False)
     return out
 
 
@@ -338,6 +340,7 @@ def _deserialize_operand(op_dict: Dict[str, Any], include_enhancements: bool = F
         if 'symbol_ref' in op_dict:
             op._temp_symbol_ref = op_dict['symbol_ref']
         op.rip_relative = op_dict.get('rip_relative', False)
+        op.via_got = op_dict.get('via_got', False)
     return op
 
 def _deserialize_instruction(instr_dict: Dict[str, Any], include_enhancements: bool = False) -> Instruction:

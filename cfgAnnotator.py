@@ -111,12 +111,31 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                         instr_map[instr_id] = (bb_id, instr_dict)
                         instr_dict['parent'] = bb_id   # ← parent as string ID (basic block id)
 
-                        # annotate rip_relative
+                        # annotate rip_relative and normalize GOT-style displacements
                         for op in instr_dict.get('operands', []):
                             if isinstance(op, dict) and 'memory' in op:
                                 mem = op['memory']
                                 if isinstance(mem, dict) and mem.get('base', '').upper() == 'RIP':
+                                    # mark rip-relative
                                     op['rip_relative'] = True
+                                    # default (explicit) via_got False unless we detect a GOT wrt hint
+                                    op['via_got'] = False
+
+                                    # normalize displacement strings like:
+                                    #   "stderr wrt ..got"  -> "stderr", symbol_ref="stderr", via_got=True
+                                    disp = mem.get('displacement')
+                                    if isinstance(disp, str):
+                                        low = disp.lower()
+                                        # simple, robust detection: require both 'wrt' and 'got' (case-insensitive)
+                                        if 'wrt' in disp and 'got' in low:
+                                            # symbol name is the part before 'wrt'
+                                            sym = disp.split('wrt', 1)[0].strip()
+                                            if sym:
+                                                mem['displacement'] = sym
+                                                # set symbol_ref for downstream passes (string form)
+                                                op['symbol_ref'] = sym
+                                                op['via_got'] = True
+
 
                 new_children.append(child)
 
@@ -267,6 +286,9 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
             if 'memory' in op and isinstance(op['memory'], dict):
                 disp = op['memory'].get('displacement')
                 if isinstance(disp, str) and disp in symbol_catalog:
+                    # If via_got was not explicitly detected earlier, make it explicit False
+                    if 'via_got' not in op:
+                        op['via_got'] = False
                     op['symbol_ref'] = disp
 
     # Program-level symbol table
