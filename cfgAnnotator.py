@@ -251,7 +251,7 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
     for label_name, info in label_def_map.items():
         kind = 'function' if info.get('bb_id') and (label_name in global_set or any(f.get('entry_label') == label_name for f in func_map.values())) else 'label'
         symbol_catalog[label_name] = {'kind': kind, 'def': info, 'visibility': 'global' if label_name in global_set else 'local'}
-    for ext in extern_symbols:
+    for ext in sorted(extern_symbols):
         symbol_catalog[ext] = {'kind': 'external', 'visibility': 'global'}
 
     # Centralized operand symbol_ref annotation + external kind inference
@@ -302,7 +302,7 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
             'definition': {'section': info.get('section'), 'raw': info.get('def')},
             'visibility': 'global' if name in global_set else 'local'
         })
-    for ext in extern_symbols:
+    for ext in sorted(extern_symbols):
         cat_kind = symbol_catalog.get(ext, {}).get('kind', 'external')
         program_symbol_table[ext] = {
             'kind': cat_kind,
