@@ -25,6 +25,7 @@ class Program(ASTNode):
     sections: List['Section'] = field(default_factory=list)
     globals: List[str] = field(default_factory=list)
     symbol_table: Dict[str, Any] = field(default_factory=dict)
+    id_maps: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -276,13 +277,6 @@ def ast_to_legacy_section_dict(section: Section, include_instr_locations: bool =
 
 
 def ast_to_legacy_program_dict(program: Program, include_instr_locations: bool = False, include_enhancements: bool = False) -> Dict[str, Any]:
-    """
-    Backwards-compatible legacy shape:
-      {"program": [ {"section": ...}, {"globals":[...]} , {"section": ...}, ... ]}
-
-    Passing include_instr_locations=True will preserve per-instruction location
-    objects in the produced legacy dict; default is False to reduce verbosity.
-    """
     out: List[Union[Dict[str, Any], Any]] = []
     # find .text or fallback
     text_sec = None
@@ -300,9 +294,13 @@ def ast_to_legacy_program_dict(program: Program, include_instr_locations: bool =
         if s is text_sec:
             continue
         out.append({'section': ast_to_legacy_section_dict(s, include_instr_locations=include_instr_locations, include_enhancements=include_enhancements)})
+
+    # Build final dict with metadata at top level (no wrapper, no list entries)
+    result: Dict[str, Any] = {'program': out}
     if include_enhancements:
-        out.append({'symbol_table': program.symbol_table})
-    return {'program': out}
+        result['symbol_table'] = program.symbol_table
+        result['id_maps'] = program.id_maps
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -445,22 +443,27 @@ def _deserialize_section(sec_dict: Dict[str, Any], include_enhancements: bool = 
 
 
 def legacy_program_dict_to_ast(program_dict: Dict[str, Any], include_enhancements: bool = False) -> Program:
-    """
-    Reverse of ast_to_legacy_program_dict.
-    Reconstructs a Program instance from the legacy dictionary format.
-    Preserves the deterministic section ordering used by the serializer:
-      - sections appear in the order they are serialized ('.text' or fallback first,
-        followed by remaining sections in original order).
-    Raises ValueError on invalid input.
-    """
     if not isinstance(program_dict, dict) or 'program' not in program_dict:
         raise ValueError("Input must be a dict with 'program' key")
     items = program_dict['program']
     if not isinstance(items, list) or len(items) < 2:
         raise ValueError("Legacy program must have at least section + globals entries")
+
+    # Extract metadata (direct top-level keys preferred)
+    symbol_table: Dict[str, Any] = program_dict.get('symbol_table', {})
+    id_maps: Dict[str, Any] = program_dict.get('id_maps', {})
+
+    # Backward compatibility: fall back to old top-level "enhancements" wrapper if direct keys missing
+    if 'enhancements' in program_dict:
+        enh = program_dict['enhancements']
+        if 'symbol_table' in enh:
+            symbol_table = enh.get('symbol_table', symbol_table)
+        if 'id_maps' in enh:
+            id_maps = enh.get('id_maps', id_maps)
+
     sections: List[Section] = []
     globals_list: Optional[List[str]] = None
-    symbol_table: Dict[str, Any] = {}  # Added: For program symbol_table
+
     for i, item in enumerate(items):
         if i == 1:
             if not isinstance(item, dict) or 'globals' not in item:
@@ -470,21 +473,23 @@ def legacy_program_dict_to_ast(program_dict: Dict[str, Any], include_enhancement
                 raise ValueError("'globals' must be a list of strings")
         elif 'section' in item:
             sec_dict = item['section']
-            # Changed: Pass include_enhancements to section deserializer
             section = _deserialize_section(sec_dict, include_enhancements=include_enhancements)
             sections.append(section)
-        # Added: Handle symbol_table entry if enhancements
-        elif include_enhancements and 'symbol_table' in item:
-            symbol_table = item['symbol_table']
         else:
             raise ValueError("Unexpected entry in program")
+
     if globals_list is None:
         raise ValueError("Globals entry not found")
-    # Changed: Pass symbol_table to Program
-    program = Program(sections=sections, globals=globals_list, symbol_table=symbol_table)
-    # Added: Post-deserialization linking and parent setting if enhancements
+
+    program = Program(
+        sections=sections,
+        globals=globals_list,
+        symbol_table=symbol_table,
+        id_maps=id_maps  # NEW
+    )
+
+    # Post-deserialization linking (unchanged except now uses direct fields)
     if include_enhancements:
-        # Build maps for linking
         bb_map: Dict[str, BasicBlock] = {}
         label_map: Dict[str, Label] = {}
         instr_map: Dict[str, Instruction] = {}
@@ -525,7 +530,8 @@ def legacy_program_dict_to_ast(program_dict: Dict[str, Any], include_enhancement
                             it.parent = child
                         elif isinstance(it, Instruction):
                             instr_map[it.id] = it
-                            it.parent = child  # Rare, but for consistency
+                            it.parent = child
+
     return program
 
 
