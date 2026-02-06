@@ -74,6 +74,7 @@ class Function(ASTNode):
     location: Optional[Dict[str, Any]] = None
     parent: Optional[Union['Section', 'Program']] = None
     id: Optional[str] = None
+    noreturn_kind: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -248,6 +249,8 @@ def _serialize_function(func: Function, include_instr_locations: bool = False, i
         if func.parent:
             if isinstance(func.parent, Section):
                 res['parent'] = func.parent.name
+        if func.noreturn_kind is not None:
+            res['noreturn_kind'] = func.noreturn_kind
     return res
 
 
@@ -410,6 +413,8 @@ def _deserialize_function(func_dict: Dict[str, Any], include_enhancements: bool 
         func.location = func_dict['location']
     if include_enhancements:
         func.id = func_dict.get('id')
+        if 'noreturn_kind' in func_dict:
+            func.noreturn_kind = func_dict['noreturn_kind']
     return func
 
 
@@ -497,16 +502,19 @@ def legacy_program_dict_to_ast(program_dict: Dict[str, Any], include_enhancement
         id_maps=id_maps  # NEW
     )
 
-    # Post-deserialization linking (unchanged except now uses direct fields)
+    # Post-deserialization linking
     if include_enhancements:
         bb_map: Dict[str, BasicBlock] = {}
         label_map: Dict[str, Label] = {}
         instr_map: Dict[str, Instruction] = {}
+
+        # Pass 1: Populate all maps and set parent pointers.
+        # We must populate the maps fully before resolving links to handle forward references.
         for section in program.sections:
             section.parent = program
             for child in section.children:
+                child.parent = section
                 if isinstance(child, Function):
-                    child.parent = section
                     for bb in child.basic_blocks:
                         bb.parent = child
                         bb_map[bb.id] = bb
@@ -515,31 +523,56 @@ def legacy_program_dict_to_ast(program_dict: Dict[str, Any], include_enhancement
                         for instr in bb.instructions:
                             instr.parent = bb
                             instr_map[instr.id] = instr
+                elif isinstance(child, LabelGroup):
+                    for it in child.instructions:
+                        if isinstance(it, Label):
+                            it.parent = child
+                            label_map[it.name] = it
+                        elif isinstance(it, Instruction):
+                            it.parent = child
+                            instr_map[it.id] = it
+
+        # Pass 2: Resolve links using the fully populated maps.
+        for section in program.sections:
+            for child in section.children:
+                if isinstance(child, Function):
+                    for bb in child.basic_blocks:
+                        # Resolve successors
+                        if hasattr(bb, '_temp_successors'):
+                            bb.successors = [bb_map[s_id] for s_id in bb._temp_successors if s_id in bb_map]
+                            del bb._temp_successors
+
+                        # Resolve predecessors
+                        if hasattr(bb, '_temp_predecessors'):
+                            bb.predecessors = [bb_map[p_id] for p_id in bb._temp_predecessors if p_id in bb_map]
+                            del bb._temp_predecessors
+
+                        # Resolve terminator
+                        if hasattr(bb, '_temp_terminator'):
+                            bb.terminator = instr_map.get(bb._temp_terminator)
+                            del bb._temp_terminator
+
+                        # Resolve instruction links
+                        for instr in bb.instructions:
+                            # Resolve target_blocks
+                            if hasattr(instr, '_temp_target_blocks'):
+                                instr.target_blocks = [bb_map[tb_id] for tb_id in instr._temp_target_blocks if tb_id in bb_map]
+                                del instr._temp_target_blocks
+
+                            # Resolve operand symbol_refs
                             for op in instr.operands:
                                 if hasattr(op, '_temp_symbol_ref'):
                                     op.symbol_ref = label_map.get(op._temp_symbol_ref)
                                     del op._temp_symbol_ref
-                            if hasattr(instr, '_temp_target_blocks'):
-                                instr.target_blocks = [bb_map[tb_id] for tb_id in instr._temp_target_blocks if tb_id in bb_map]
-                                del instr._temp_target_blocks
-                        if hasattr(bb, '_temp_successors'):
-                            bb.successors = [bb_map[s_id] for s_id in bb._temp_successors if s_id in bb_map]
-                            del bb._temp_successors
-                        if hasattr(bb, '_temp_predecessors'):
-                            bb.predecessors = [bb_map[p_id] for p_id in bb._temp_predecessors if p_id in bb_map]
-                            del bb._temp_predecessors
-                        if hasattr(bb, '_temp_terminator'):
-                            bb.terminator = instr_map.get(bb._temp_terminator)
-                            del bb._temp_terminator
+
                 elif isinstance(child, LabelGroup):
-                    child.parent = section
+                    # Resolve symbol_refs in LabelGroup instructions
                     for it in child.instructions:
-                        if isinstance(it, Label):
-                            label_map[it.name] = it
-                            it.parent = child
-                        elif isinstance(it, Instruction):
-                            instr_map[it.id] = it
-                            it.parent = child
+                        if isinstance(it, Instruction):
+                            for op in it.operands:
+                                if hasattr(op, '_temp_symbol_ref'):
+                                    op.symbol_ref = label_map.get(op._temp_symbol_ref)
+                                    del op._temp_symbol_ref
 
     return program
 
