@@ -54,7 +54,7 @@ class BasicBlock(ASTNode):
     `instructions` is an ordered list containing Instruction instances.
     """
     instructions: List['Instruction'] = field(default_factory=list)
-    id: str = field(default_factory=lambda: str(hash(frozenset())))  # Unique identifier
+    id: Optional[str] = None
     start_label: Optional['Label'] = None
     location: Optional[Dict[str, Any]] = None
     parent: Optional['Function'] = None
@@ -73,7 +73,7 @@ class Function(ASTNode):
     entry_label: Optional[str] = None
     location: Optional[Dict[str, Any]] = None
     parent: Optional[Union['Section', 'Program']] = None
-    symbol_table: Dict[str, Any] = field(default_factory=dict)
+    id: Optional[str] = None
 
 
 @dataclass
@@ -84,6 +84,7 @@ class Instruction(ASTNode):
     location: Optional[Dict[str, Any]] = None
     parent: Optional['BasicBlock'] = None
     target_blocks: List['BasicBlock'] = field(default_factory=list)
+    id: Optional[str] = None
 
 
 @dataclass
@@ -179,7 +180,7 @@ def _serialize_operand(op: Operand, include_enhancements: bool = False) -> Dict[
         out['memory'] = mem
     if include_enhancements:
         if op.symbol_ref:
-            out['symbol_ref'] = op.symbol_ref.name  # Use name for reference
+            out['symbol_ref'] = op.symbol_ref.name
         out['rip_relative'] = op.rip_relative
         # expose via_got explicitly (bool)
         out['via_got'] = getattr(op, 'via_got', False)
@@ -193,8 +194,11 @@ def _serialize_instruction(instr: Instruction, include_instr_locations: bool = F
     if instr.operands:
         res['operands'] = [_serialize_operand(o, include_enhancements=include_enhancements) for o in instr.operands]
     if include_enhancements:
-        res['id'] = instr.id  # For referencing in terminator, etc.
+        if instr.id is not None:
+            res['id'] = instr.id
         res['target_blocks'] = [tb.id for tb in instr.target_blocks]
+        if instr.parent:
+            res['parent'] = instr.parent.id
     return res
 
 
@@ -220,11 +224,14 @@ def _serialize_basic_block(bb: BasicBlock, include_instr_locations: bool = False
     if bb.location:
         res['location'] = bb.location
     # Added: Serialize enhancements if requested
+    res['id'] = bb.id
     if include_enhancements:
         if bb.terminator:
-            res['terminator'] = bb.terminator.id  # Use ID for reference
+            res['terminator'] = bb.terminator.id
         res['successors'] = [s.id for s in bb.successors]
         res['predecessors'] = [p.id for p in bb.predecessors]
+        if bb.parent:
+            res['parent'] = bb.parent.id
     return res
 
 
@@ -236,7 +243,11 @@ def _serialize_function(func: Function, include_instr_locations: bool = False, i
     if func.location:
         res['location'] = func.location
     if include_enhancements:
-        res['symbol_table'] = func.symbol_table
+        if func.id is not None:
+            res['id'] = func.id
+        if func.parent:
+            if isinstance(func.parent, Section):
+                res['parent'] = func.parent.name
     return res
 
 
@@ -348,7 +359,7 @@ def _deserialize_instruction(instr_dict: Dict[str, Any], include_enhancements: b
     operands = [_deserialize_operand(o, include_enhancements=include_enhancements) for o in operands_dicts]
     instr = Instruction(opcode=opcode, operands=operands, prefix=prefix)
     if include_enhancements:
-        instr.id = instr_dict.get('id', str(hash(frozenset())))
+        instr.id = instr_dict.get('id')
         instr._temp_target_blocks = instr_dict.get('target_blocks', [])
     return instr
 
@@ -398,7 +409,7 @@ def _deserialize_function(func_dict: Dict[str, Any], include_enhancements: bool 
     if 'location' in func_dict:
         func.location = func_dict['location']
     if include_enhancements:
-        func.symbol_table = func_dict.get('symbol_table', {})
+        func.id = func_dict.get('id')
     return func
 
 
@@ -433,10 +444,8 @@ def _deserialize_section(sec_dict: Dict[str, Any], include_enhancements: bool = 
     children_dicts = sec_dict.get('children', [])
     for child_dict in children_dicts:
         if 'lgroup' in child_dict:
-            # Changed: Pass include_enhancements to lgroup deserializer
             children.append(_deserialize_lgroup(child_dict, include_enhancements=include_enhancements))
         elif 'function' in child_dict:
-            # Changed: Pass include_enhancements to function deserializer
             children.append(_deserialize_function(child_dict['function'], include_enhancements=include_enhancements))
     pseudo_instruct = sec_dict.get('pseudo_instruct', [])
     return Section(name=name, children=children, pseudo_instruct=pseudo_instruct, location=location)
