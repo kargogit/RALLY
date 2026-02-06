@@ -508,6 +508,23 @@ def legacy_program_dict_to_ast(program_dict: Dict[str, Any], include_enhancement
         label_map: Dict[str, Label] = {}
         instr_map: Dict[str, Instruction] = {}
 
+        # Helper to resolve symbol_refs robustly
+        def _resolve_symbol_ref(op: Operand, lbl_map: Dict[str, Label]):
+            if hasattr(op, '_temp_symbol_ref'):
+                sym_name = op._temp_symbol_ref
+                target_label = lbl_map.get(sym_name)
+
+                if target_label:
+                    op.symbol_ref = target_label
+                else:
+                    # If the symbol is not found in the local label map (e.g., it is a data symbol
+                    # or an external function), we create a synthetic Label object to preserve the
+                    # symbol reference name. This ensures that symbol_ref is not dropped during
+                    # serialization for valid symbols that aren't code labels.
+                    op.symbol_ref = Label(name=sym_name)
+
+                del op._temp_symbol_ref
+
         # Pass 1: Populate all maps and set parent pointers.
         # We must populate the maps fully before resolving links to handle forward references.
         for section in program.sections:
@@ -561,18 +578,14 @@ def legacy_program_dict_to_ast(program_dict: Dict[str, Any], include_enhancement
 
                             # Resolve operand symbol_refs
                             for op in instr.operands:
-                                if hasattr(op, '_temp_symbol_ref'):
-                                    op.symbol_ref = label_map.get(op._temp_symbol_ref)
-                                    del op._temp_symbol_ref
+                                _resolve_symbol_ref(op, label_map)
 
                 elif isinstance(child, LabelGroup):
                     # Resolve symbol_refs in LabelGroup instructions
                     for it in child.instructions:
                         if isinstance(it, Instruction):
                             for op in it.operands:
-                                if hasattr(op, '_temp_symbol_ref'):
-                                    op.symbol_ref = label_map.get(op._temp_symbol_ref)
-                                    del op._temp_symbol_ref
+                                _resolve_symbol_ref(op, label_map)
 
     return program
 
