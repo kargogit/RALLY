@@ -23,78 +23,141 @@ class ASTNode:
 @dataclass
 class Program(ASTNode):
     sections: List['Section'] = field(default_factory=list)
+    """All sections in the program (e.g., .text, .data, .bss, .init_array). The .text section (or first section if missing) is serialized first."""
+
     globals: List[str] = field(default_factory=list)
+    """List of global symbol names exposed by the binary (e.g., ['main'])."""
+
     symbol_table: Dict[str, Any] = field(default_factory=dict)
+    """Symbol metadata map (symbol name → details such as kind, visibility, definition). Only present/populated when include_enhancements=True."""
+
     id_maps: Dict[str, Any] = field(default_factory=dict)
+    """Mapping of synthetic IDs to metadata for functions and basic blocks (e.g., 'functions' and 'basic_blocks' sub-maps). Only present when include_enhancements=True."""
 
 
 @dataclass
 class Section(ASTNode):
     name: str
+    """Name of the section (e.g., '.text', '.data', '.bss')."""
+
     children: List[Union['LabelGroup', 'Function']] = field(default_factory=list)
+    """Ordered list of top-level children: either flat LabelGroup (for non-function code) or Function (for CFG-structured code)."""
+
     pseudo_instruct: List[Dict[str, Any]] = field(default_factory=list)
+    """List of pseudo-instructions/directives specific to the section (e.g., {'directive': 'default', 'params': ['rel']}, extern declarations, data definitions)."""
+
     location: Optional[Dict[str, Any]] = None
+    """Optional source/location metadata (e.g., file offset or address range). Rarely used."""
+
     parent: Optional['Program'] = None
+    """Back-reference to containing Program object (set during deserialization; not serialized)."""
 
 
 @dataclass
 class LabelGroup(ASTNode):
     """
-    A contiguous block of labels and instructions.
+    A contiguous block of labels and instructions (used for flat/non-CFG code).
     `instructions` is an ordered list containing Label or Instruction instances.
     """
     instructions: List[Union['Instruction', 'Label']] = field(default_factory=list)
+    """Sequential mix of labels and instructions in the flat group."""
+
     parent: Optional['Section'] = None
 
 
 @dataclass
 class BasicBlock(ASTNode):
     """
-    A basic block of instructions.
+    A basic block of instructions forming part of a control-flow graph.
     `instructions` is an ordered list containing Instruction instances.
     """
     instructions: List['Instruction'] = field(default_factory=list)
+    """Ordered list of instructions in the block (non-branch instructions + optional terminator)."""
+
     id: Optional[str] = None
+    """Synthetic unique identifier (e.g., 'bb_0'). Required/populated when include_enhancements=True; serialized as string."""
+
     start_label: Optional['Label'] = None
+    """Label object that starts the block (if any). In typed AST: Label object; in legacy dict: string name under 'start_label'."""
+
     location: Optional[Dict[str, Any]] = None
+    """Optional location/address metadata for the block."""
+
     parent: Optional['Function'] = None
+    """Back-reference to containing Function (set during deserialization; serialized as parent function id when enhancements enabled)."""
+
     terminator: Optional['Instruction'] = None
+    """The terminating/branch instruction of the block (if present). In typed AST: Instruction object; in legacy dict: string id."""
+
     successors: List['BasicBlock'] = field(default_factory=list)
+    """List of successor BasicBlock objects. In typed AST: object references; in legacy dict: list of string ids."""
+
     predecessors: List['BasicBlock'] = field(default_factory=list)
+    """List of predecessor BasicBlock objects. In typed AST: object references; in legacy dict: list of string ids."""
 
 
 @dataclass
 class Function(ASTNode):
     """
-    A function that groups basic blocks.
+    A function that groups basic blocks into a control-flow graph.
     `basic_blocks` is an ordered list containing BasicBlock instances.
     """
     basic_blocks: List['BasicBlock'] = field(default_factory=list)
+    """Ordered list of basic blocks belonging to the function."""
+
     entry_label: Optional[str] = None
+    """Name of the entry label (e.g., 'main', 'print_help'). Stored as string."""
+
     location: Optional[Dict[str, Any]] = None
+    """Optional location metadata for the function."""
+
     parent: Optional[Union['Section', 'Program']] = None
+    """Back-reference to containing Section or Program (set during deserialization; serialized as parent name/id when enhancements enabled)."""
+
     id: Optional[str] = None
+    """Synthetic unique identifier (e.g., 'func:main'). Populated when include_enhancements=True; serialized as string."""
+
     noreturn_kind: Optional[str] = field(default=None)
+    """Indicates noreturn semantics if present (e.g., 'noreturn')."""
 
 
 @dataclass
 class Instruction(ASTNode):
     opcode: str
+    """Instruction opcode (e.g., 'MOV', 'CALL', 'RET', 'LOCK INC')."""
+
     operands: List['Operand'] = field(default_factory=list)
+    """List of operand objects (0–3 typically)."""
+
     prefix: Optional[str] = None
+    """Optional instruction prefix (e.g., 'LOCK')."""
+
     location: Optional[Dict[str, Any]] = None
+    """Optional per-instruction location metadata (controlled by include_instr_locations)."""
+
     parent: Optional['BasicBlock'] = None
+    """Back-reference to containing BasicBlock (set during deserialization; serialized as parent bb id when enhancements enabled)."""
+
     target_blocks: List['BasicBlock'] = field(default_factory=list)
+    """List of target BasicBlock objects for branch/call instructions. In typed AST: object references; in legacy dict: list of string ids."""
+
     id: Optional[str] = None
+    """Synthetic unique identifier (e.g., 'instr_42'). Populated when include_enhancements=True; serialized as string."""
 
 
 @dataclass
 class Label(ASTNode):
     name: str
-    location: Optional[Dict[str, Any]] = None
-    parent: Optional[Union['LabelGroup', 'BasicBlock']] = None
-    id: Optional[str] = None
+    """Label name (e.g., 'main', '.sum_loop')."""
 
+    location: Optional[Dict[str, Any]] = None
+    """Optional location metadata for the label."""
+
+    parent: Optional[Union['LabelGroup', 'BasicBlock']] = None
+    """Back-reference to containing LabelGroup or BasicBlock (set during deserialization; not serialized directly)."""
+
+    id: Optional[str] = None
+    """Synthetic identifier (defaults to 'label_{name}' via __post_init__). Serialized when enhancements enabled."""
     def __post_init__(self):
         if self.id is None:
             self.id = f"label_{self.name}"
@@ -102,51 +165,90 @@ class Label(ASTNode):
 @dataclass
 class Operand(ASTNode):
     register: Optional[str] = None
+    """Register name if operand is a register (e.g., 'RAX', 'RDI')."""
+
     memory: Optional['Memory'] = None
+    """Memory addressing mode if operand is memory access."""
+
     integer: Optional['Immediate'] = None
+    """Immediate integer value if operand is a constant."""
+
     expression: Optional[Any] = None
+    """Complex expression (rare; may be str like 'numbers' or dict structure)."""
+
     size: Optional[str] = None
+    """Explicit operand size override (e.g., 'BYTE', 'DWORD')."""
+
     name: Optional[str] = None
+    """Symbolic name for call targets or similar (e.g., 'printf')."""
+
     symbol_ref: Optional['Label'] = None
+    """Reference to a Label object for symbolic addresses. In typed AST: Label object; in legacy dict (enhancements): string name."""
+
     rip_relative: bool = False
+    """Flag indicating RIP-relative addressing (serialized when enhancements enabled)."""
+
     via_got: bool = False
+    """Flag indicating access via Global Offset Table (serialized explicitly when enhancements enabled)."""
 
 @dataclass
 class Memory(ASTNode):
     base: Optional[str] = None
+    """Base register (e.g., 'RIP', 'RSI')."""
+
     index: Optional[str] = None
+    """Index register for scaled indexing."""
+
     scale: Optional[int] = None
+    """Scale factor for index (1, 2, 4, 8)."""
+
     displacement: Optional[Union[int, str]] = None
+    """Displacement/offset: integer offset or symbol name (e.g., 'usage_msg')."""
 
 
 @dataclass
 class Immediate(ASTNode):
     value: Union[int, str]
+    """Immediate value (int or hex string representation)."""
+
     type: str
+    """Type classification (e.g., 'DECIMAL_INTEGER', 'HEX_INTEGER', 'BYTE')."""
+
     ascii: Optional[str] = None
+    """Optional ASCII character representation for byte values (e.g., '-')."""
 
 
 @dataclass
 class Register(ASTNode):
     name: str
+    """Register name (standalone register operand; rarely used directly)."""
 
 
 @dataclass
 class Name(ASTNode):
     value: str
+    """Standalone symbolic name (rarely used directly)."""
 
 
 @dataclass
 class Expression(ASTNode):
     type: str
+    """Expression type (e.g., 'additive')."""
+
     operands: List[ASTNode] = field(default_factory=list)
+    """Sub-operands of the expression."""
+
     operator: Optional[str] = None
+    """Operator if applicable."""
 
 
 @dataclass
 class GlobalDecl(ASTNode):
     name: str
+    """Name of a global declaration (unused in current pipeline)."""
+
     location: Optional[Dict[str, Any]] = None
+    """Optional location metadata."""
 
 
 # ---------------------------------------------------------------------------
