@@ -790,7 +790,14 @@ class AsmTransformer(ParseTreeVisitor):
                     int_entry = {'type': imm.type, 'value': imm.value}
                     if getattr(imm, 'ascii', None) is not None:
                         int_entry['ascii'] = imm.ascii
-                    pseudo_dict['integer'] = int_entry
+                    # if we previously saw an 'equ' token,
+                    # attach the integer under the 'equ' field rather than
+                    # at top-level. This preserves the semantics of "name equ X".
+                    if equ_pending:
+                        pseudo_dict['equ'] = {'integer': int_entry}
+                        equ_pending = False
+                    else:
+                        pseudo_dict['integer'] = int_entry
             elif '_loc' in item:
                 pass
             else:
