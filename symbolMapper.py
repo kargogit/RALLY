@@ -150,7 +150,11 @@ class SymbolMapper:
                 self._parse_legacy_pseudo_data(sec, sec_name)
 
     def _process_ctors_dtors(self):
-        """Maps .init_array/.fini_array to llvm.global_ctors / llvm.global_dtors."""
+        """
+        Maps .init_array/.fini_array to llvm.global_ctors / llvm.global_dtors.
+        After mapping, these sections are removed from the program AST to prevent
+        duplicate intent, as the information is now canonicalized in the symbol table.
+        """
         def handle_array(sec_name: str, llvm_global: str):
             sec = self.section_map.get(sec_name)
             if not sec:
@@ -171,6 +175,13 @@ class SymbolMapper:
 
         handle_array('.init_array', 'llvm.global_ctors')
         handle_array('.fini_array', 'llvm.global_dtors')
+
+        # Fix: Remove the explicit .init_array/.fini_array sections now that their
+        # intent is captured by llvm.global_ctors/dtors in the symbol table.
+        self.program.sections = [s for s in self.program.sections if s.name not in ('.init_array', '.fini_array')]
+        # Update the section map for internal consistency
+        self.section_map.pop('.init_array', None)
+        self.section_map.pop('.fini_array', None)
 
     def _format_string_constant(self, flat_values: List[int]) -> Optional[str]:
         """If the data is a null-terminated byte string, format as c\"...\\00\"."""
