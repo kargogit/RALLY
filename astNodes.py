@@ -40,8 +40,8 @@ class Section(ASTNode):
     name: str
     """Name of the section (e.g., '.text', '.data', '.bss')."""
 
-    children: List[Union['LabelGroup', 'Function']] = field(default_factory=list)
-    """Ordered list of top-level children: either flat LabelGroup (for non-function code) or Function (for CFG-structured code)."""
+    children: List[Union['LabelGroup', 'Function', 'DataGroup']] = field(default_factory=list)
+    """Ordered list of top-level children: LabelGroup/Function for code, DataGroup for data sections."""
 
     pseudo_instruct: List[Dict[str, Any]] = field(default_factory=list)
     """List of pseudo-instructions/directives specific to the section (e.g., {'directive': 'default', 'params': ['rel']}, extern declarations, data definitions)."""
@@ -251,9 +251,73 @@ class GlobalDecl(ASTNode):
     """Optional location metadata."""
 
 
+@dataclass
+class DataDirective(ASTNode):
+    """A single data directive (db/dw/dd/dq/resb/resw/resd/resq/align/times/global/extern/etc.)."""
+    kind: str  # e.g., 'DB', 'DW', 'DD', 'DQ', 'RESB', 'RESW', 'RESD', 'RESQ', 'ALIGN', 'TIMES', 'GLOBAL', 'EXTERN'
+    operands: List[Union[Immediate, str, Expression]] = field(default_factory=list)
+    # - Immediate for numeric values
+    # - str for string literals (e.g., "hello\n")
+    # - Expression for symbolic expressions (rare in data, but supported)
+    repeat: Optional[Immediate] = None  # For TIMES prefix; only Immediate (symbolic TIMES is rare and can be left unsupported initially)
+    alignment: Optional[int] = None     # Only meaningful for ALIGN
+    parent: Optional['DataGroup'] = None
+
+
+@dataclass
+class DataGroup(ASTNode):
+    """Contiguous group of labels and data directives (used for .data/.rodata/.bss)."""
+    items: List[Union['Label', 'DataDirective']] = field(default_factory=list)
+    parent: Optional['Section'] = None
+
+
 # ---------------------------------------------------------------------------
 # Deterministic serializer: typed AST -> legacy dict shape (compact JSON)
 # ---------------------------------------------------------------------------
+
+def _serialize_data_directive(dd: DataDirective, include_enhancements: bool = False) -> Dict[str, Any]:
+    res: Dict[str, Any] = {'kind': dd.kind}
+    if dd.operands:
+        serialized_ops = []
+        for op in dd.operands:
+            if isinstance(op, Immediate):
+                int_obj = {'value': op.value, 'type': op.type}
+                if op.ascii is not None:
+                    int_obj['ascii'] = op.ascii
+                serialized_ops.append({'immediate': int_obj})
+            elif isinstance(op, str):
+                serialized_ops.append({'string': op})
+            elif isinstance(op, Expression):
+                # Fallback: serialize as raw dict if Expression is dict-like, else str
+                serialized_ops.append({'expression': op.__dict__ if hasattr(op, '__dict__') else str(op)})
+            else:
+                serialized_ops.append(op)  # legacy passthrough
+        res['operands'] = serialized_ops
+    if dd.repeat is not None:
+        int_obj = {'value': dd.repeat.value, 'type': dd.repeat.type}
+        if dd.repeat.ascii is not None:
+            int_obj['ascii'] = dd.repeat.ascii
+        res['repeat'] = int_obj
+    if dd.alignment is not None:
+        res['alignment'] = dd.alignment
+    if include_enhancements and dd.parent:
+        # Optional: expose parent if needed
+        pass
+    return res
+
+def _serialize_dgroup(dg: DataGroup, include_instr_locations: bool = False, include_enhancements: bool = False) -> Dict[str, Any]:
+    items: List[Dict[str, Any]] = []
+    for it in dg.items:
+        if isinstance(it, Label):
+            item: Dict[str, Any] = {'label': it.name}
+            if it.location:
+                item['location'] = it.location
+            if include_enhancements and it.id:
+                item['id'] = it.id
+            items.append(item)
+        elif isinstance(it, DataDirective):
+            items.append({'data_directive': _serialize_data_directive(it, include_enhancements=include_enhancements)})
+    return {'dgroup': items}
 
 def _serialize_operand(op: Operand, include_enhancements: bool = False) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
@@ -383,6 +447,8 @@ def ast_to_legacy_section_dict(section: Section, include_instr_locations: bool =
             children.append(_serialize_lgroup(child, include_instr_locations=include_instr_locations, include_enhancements=include_enhancements))
         elif isinstance(child, Function):
             children.append({'function': _serialize_function(child, include_instr_locations=include_instr_locations, include_enhancements=include_enhancements)})
+        elif isinstance(child, DataGroup):
+            children.append(_serialize_dgroup(child, include_enhancements=include_enhancements))
     if children:
         sec['children'] = children
     if section.pseudo_instruct:
@@ -422,6 +488,42 @@ def ast_to_legacy_program_dict(program: Program, include_instr_locations: bool =
 # ---------------------------------------------------------------------------
 # Deterministic deserializer: legacy dict shape -> typed AST
 # ---------------------------------------------------------------------------
+
+def _deserialize_data_directive(dd_dict: Dict[str, Any], include_enhancements: bool = False) -> DataDirective:
+    kind = dd_dict['kind']
+    operands: List[Union[Immediate, str, Expression]] = []
+    for op_dict in dd_dict.get('operands', []):
+        if 'immediate' in op_dict:
+            int_dict = op_dict['immediate']
+            operands.append(Immediate(value=int_dict['value'], type=int_dict['type'], ascii=int_dict.get('ascii')))
+        elif 'string' in op_dict:
+            operands.append(op_dict['string'])
+        elif 'expression' in op_dict:
+            # Reconstruct minimal Expression or keep as dict
+            operands.append(Expression(type='unknown', operands=[]))  # placeholder
+        else:
+            operands.append(op_dict)  # legacy passthrough
+    repeat = None
+    if 'repeat' in dd_dict:
+        int_dict = dd_dict['repeat']
+        repeat = Immediate(value=int_dict['value'], type=int_dict['type'], ascii=int_dict.get('ascii'))
+    alignment = dd_dict.get('alignment')
+    return DataDirective(kind=kind, operands=operands, repeat=repeat, alignment=alignment)
+
+def _deserialize_dgroup(dg_dict: Dict[str, Any], include_enhancements: bool = False) -> DataGroup:
+    if 'dgroup' not in dg_dict:
+        raise ValueError("Expected 'dgroup' key in data group dict")
+    items = dg_dict['dgroup']
+    parsed_items: List[Union[Label, DataDirective]] = []
+    for it in items:
+        if 'label' in it:
+            lbl = Label(name=it['label'], location=it.get('location'))
+            if include_enhancements and 'id' in it:
+                lbl.id = it['id']
+            parsed_items.append(lbl)
+        elif 'data_directive' in it:
+            parsed_items.append(_deserialize_data_directive(it['data_directive'], include_enhancements=include_enhancements))
+    return DataGroup(items=parsed_items)
 
 def _deserialize_operand(op_dict: Dict[str, Any], include_enhancements: bool = False) -> Operand:
     op = Operand()
@@ -554,6 +656,8 @@ def _deserialize_section(sec_dict: Dict[str, Any], include_enhancements: bool = 
             children.append(_deserialize_lgroup(child_dict, include_enhancements=include_enhancements))
         elif 'function' in child_dict:
             children.append(_deserialize_function(child_dict['function'], include_enhancements=include_enhancements))
+        elif 'dgroup' in child_dict:
+            children.append(_deserialize_dgroup(child_dict, include_enhancements=include_enhancements))
     pseudo_instruct = sec_dict.get('pseudo_instruct', [])
     return Section(name=name, children=children, pseudo_instruct=pseudo_instruct, location=location)
 
