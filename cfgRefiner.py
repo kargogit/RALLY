@@ -1,4 +1,4 @@
-## step5_cfg_refiner.py
+## cfgRefiner.py
 # Refine the Control Flow Graph (CFG) by detecting noreturn functions
 # and pruning spurious fall-through edges after calls to noreturn functions.
 #

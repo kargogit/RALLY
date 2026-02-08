@@ -20,6 +20,7 @@ from astNodes import (
     LabelGroup,
     Label,
     Instruction,
+    Immediate,
     BasicBlock,
     Function,
     ast_to_legacy_program_dict,
