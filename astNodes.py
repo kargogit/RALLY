@@ -97,6 +97,29 @@ class BasicBlock(ASTNode):
 
 
 @dataclass
+class ArgumentDescriptor(ASTNode):
+    """One recovered argument."""
+    kind: str  # 'register' | 'stack' | 'float' | 'unknown'
+    location: Union[str, int]  # register name (e.g. 'rdi') or stack offset (e.g. 16)
+    index: Optional[int] = None  # 0-based argument index
+    inferred_type: Optional[str] = None  # e.g. 'i64', 'double', None
+    first_use: Optional[Dict[str, Any]] = None
+    # first_use example: {'bb': 'bb_0', 'instr': 'instr_12', 'location': {...}}
+
+
+@dataclass
+class StackSlot(ASTNode):
+    """A local stack slot, spill, or padding region."""
+    name: Optional[str] = None  # optional hint (e.g., from label usage)
+    offset: int = 0  # negative offset from rbp (or positive from rsp if no rbp)
+    size: int = 0
+    alignment: int = 0
+    kind: str = "local"  # 'local' | 'spill' | 'arg' | 'padding'
+    register: Optional[str] = None  # e.g. 'RBX' for saved register spill
+    index: int = 0  # e.g. callee-saved register index
+
+
+@dataclass
 class Function(ASTNode):
     """
     A function that groups basic blocks into a control-flow graph.
@@ -119,6 +142,19 @@ class Function(ASTNode):
 
     noreturn_kind: Optional[str] = field(default=None)
     """Indicates noreturn semantics if present (e.g., 'noreturn')."""
+
+    arguments: List[ArgumentDescriptor] = field(default_factory=list)
+
+    stack_slots: List[StackSlot] = field(default_factory=list)
+
+    return_type: Optional[str] = None
+    """Inferred return LLVM type, e.g. 'i64', 'void', 'double', or None if ambiguous."""
+
+    uses_frame_pointer: bool = False
+    """True if standard PUSH RBP / MOV RBP, RSP prolog detected."""
+
+    abi_compliance: str = "unknown"
+    """One of: 'standard', 'partial', 'custom', 'raw'."""
 
 
 @dataclass
@@ -275,6 +311,35 @@ class DataGroup(ASTNode):
 # Deterministic serializer: typed AST -> legacy dict shape (compact JSON)
 # ---------------------------------------------------------------------------
 
+def _serialize_argument_descriptor(ad: ArgumentDescriptor, include_enhancements: bool = False) -> Dict[str, Any]:
+    res: Dict[str, Any] = {
+        'kind': ad.kind,
+        'location': ad.location,
+    }
+    if ad.index is not None:
+        res['index'] = ad.index
+    if ad.inferred_type is not None:
+        res['inferred_type'] = ad.inferred_type
+    if ad.first_use is not None:
+        res['first_use'] = ad.first_use
+    return res
+
+
+def _serialize_stack_slot(ss: StackSlot, include_enhancements: bool = False) -> Dict[str, Any]:
+    res: Dict[str, Any] = {
+        'offset': ss.offset,
+        'size': ss.size,
+        'alignment': ss.alignment,
+        'kind': ss.kind,
+        'index': ss.index,
+    }
+    if ss.name is not None:
+        res['name'] = ss.name
+    if ss.register is not None:
+        res['register'] = ss.register
+    return res
+
+
 def _serialize_data_directive(dd: DataDirective, include_enhancements: bool = False) -> Dict[str, Any]:
     res: Dict[str, Any] = {'kind': dd.kind}
     if dd.operands:
@@ -417,6 +482,15 @@ def _serialize_function(func: Function, include_instr_locations: bool = False, i
                 res['parent'] = func.parent.name
         if func.noreturn_kind is not None:
             res['noreturn_kind'] = func.noreturn_kind
+        if func.arguments:  # only if non-empty
+            res['arguments'] = [_serialize_argument_descriptor(a) for a in func.arguments]
+        res['stack_slots'] = [_serialize_stack_slot(s) for s in func.stack_slots]
+        if func.return_type is not None:
+            res['return_type'] = func.return_type
+        if func.uses_frame_pointer:  # only if True (default False → omitted)
+            res['uses_frame_pointer'] = True
+        if func.abi_compliance != "unknown":  # only if analyzed to something else
+            res['abi_compliance'] = func.abi_compliance
     return res
 
 
@@ -488,6 +562,28 @@ def ast_to_legacy_program_dict(program: Program, include_instr_locations: bool =
 # ---------------------------------------------------------------------------
 # Deterministic deserializer: legacy dict shape -> typed AST
 # ---------------------------------------------------------------------------
+
+def _deserialize_argument_descriptor(ad_dict: Dict[str, Any]) -> ArgumentDescriptor:
+    return ArgumentDescriptor(
+        kind=ad_dict['kind'],
+        location=ad_dict['location'],
+        index=ad_dict.get('index'),
+        inferred_type=ad_dict.get('inferred_type'),
+        first_use=ad_dict.get('first_use'),
+    )
+
+
+def _deserialize_stack_slot(ss_dict: Dict[str, Any]) -> StackSlot:
+    return StackSlot(
+        name=ss_dict.get('name'),
+        offset=ss_dict['offset'],
+        size=ss_dict['size'],
+        alignment=ss_dict['alignment'],
+        kind=ss_dict['kind'],
+        register=ss_dict.get('register'),
+        index=ss_dict.get('index', 0),
+    )
+
 
 def _deserialize_data_directive(dd_dict: Dict[str, Any], include_enhancements: bool = False) -> DataDirective:
     kind = dd_dict['kind']
@@ -619,6 +715,17 @@ def _deserialize_function(func_dict: Dict[str, Any], include_enhancements: bool 
         func.id = func_dict.get('id')
         if 'noreturn_kind' in func_dict:
             func.noreturn_kind = func_dict['noreturn_kind']
+        func.arguments = [
+            _deserialize_argument_descriptor(ad)
+            for ad in func_dict.get('arguments', [])
+        ]
+        func.stack_slots = [
+            _deserialize_stack_slot(ss)
+            for ss in func_dict.get('stack_slots', [])
+        ]
+        func.return_type = func_dict.get('return_type')  # None if missing
+        func.uses_frame_pointer = func_dict.get('uses_frame_pointer', False)
+        func.abi_compliance = func_dict.get('abi_compliance', "unknown")
     return func
 
 
