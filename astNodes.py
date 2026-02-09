@@ -117,6 +117,7 @@ class StackSlot(ASTNode):
     kind: str = "local"  # 'local' | 'spill' | 'arg' | 'padding'
     register: Optional[str] = None  # e.g. 'RBX' for saved register spill
     index: int = 0  # e.g. callee-saved register index
+    inferred_type: Optional[str] = None  # e.g., 'i32_signed', 'f64', 'ptr', 'unknown'; for the slot's refinement
 
 
 @dataclass
@@ -180,6 +181,8 @@ class Instruction(ASTNode):
     id: Optional[str] = None
     """Synthetic unique identifier (e.g., 'instr_42'). Populated when include_enhancements=True; serialized as string."""
 
+    op_refinement: Optional[str] = None  # e.g., 'i32_unsigned', 'f64'; for operation-specific width/signedness/float
+
 
 @dataclass
 class Label(ASTNode):
@@ -226,6 +229,11 @@ class Operand(ASTNode):
 
     via_got: bool = False
     """Flag indicating access via Global Offset Table (serialized explicitly when enhancements enabled)."""
+
+    inferred_type: Optional[str] = None  # e.g., 'i8_signed', 'f32'; for the operand's value refinement (pointee for memory)
+
+    address_refinement: Optional[str] = None  # e.g., 'ptr'; only for memory operands (address components)
+
 
 @dataclass
 class Memory(ASTNode):
@@ -337,6 +345,9 @@ def _serialize_stack_slot(ss: StackSlot, include_enhancements: bool = False) -> 
         res['name'] = ss.name
     if ss.register is not None:
         res['register'] = ss.register
+    if include_enhancements:
+        if ss.refinement is not None:
+            res['refinement'] = ss.refinement
     return res
 
 
@@ -416,6 +427,10 @@ def _serialize_operand(op: Operand, include_enhancements: bool = False) -> Dict[
         out['rip_relative'] = op.rip_relative
         # expose via_got explicitly (bool)
         out['via_got'] = getattr(op, 'via_got', False)
+        if op.value_refinement is not None:
+            out['value_refinement'] = op.value_refinement  # serialized as 'pointee_refinement' equivalent for memory
+        if op.address_refinement is not None:
+            out['address_refinement'] = op.address_refinement
     return out
 
 
@@ -431,6 +446,8 @@ def _serialize_instruction(instr: Instruction, include_instr_locations: bool = F
         res['target_blocks'] = [tb.id for tb in instr.target_blocks]
         if instr.parent:
             res['parent'] = instr.parent.id
+        if instr.op_refinement is not None:
+            res['op_refinement'] = instr.op_refinement
     return res
 
 
@@ -582,6 +599,7 @@ def _deserialize_stack_slot(ss_dict: Dict[str, Any]) -> StackSlot:
         kind=ss_dict['kind'],
         register=ss_dict.get('register'),
         index=ss_dict.get('index', 0),
+        refinement=ss_dict.get('refinement') if 'refinement' in ss_dict else None,
     )
 
 
@@ -653,6 +671,8 @@ def _deserialize_operand(op_dict: Dict[str, Any], include_enhancements: bool = F
             op._temp_symbol_ref = op_dict['symbol_ref']
         op.rip_relative = op_dict.get('rip_relative', False)
         op.via_got = op_dict.get('via_got', False)
+        op.value_refinement = op_dict.get('value_refinement')
+        op.address_refinement = op_dict.get('address_refinement')
     return op
 
 def _deserialize_instruction(instr_dict: Dict[str, Any], include_enhancements: bool = False) -> Instruction:
@@ -664,6 +684,7 @@ def _deserialize_instruction(instr_dict: Dict[str, Any], include_enhancements: b
     if include_enhancements:
         instr.id = instr_dict.get('id')
         instr._temp_target_blocks = instr_dict.get('target_blocks', [])
+        instr.op_refinement = instr_dict.get('op_refinement')
     return instr
 
 
