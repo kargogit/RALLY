@@ -121,6 +121,13 @@ class StackSlot(ASTNode):
 
 
 @dataclass
+class LiftedFunctionSignature(ASTNode):
+    """Finalized LLVM function signature for lifting: ret_type (%State*). Set in Step 9."""
+    return_type: str  # e.g., 'void', 'i64', 'float', 'double'
+    attributes: List[str] = field(default_factory=list)  # e.g., ['noreturn', 'nounwind']
+
+
+@dataclass
 class Function(ASTNode):
     """
     A function that groups basic blocks into a control-flow graph.
@@ -156,6 +163,9 @@ class Function(ASTNode):
 
     abi_compliance: str = "unknown"
     """One of: 'standard', 'partial', 'custom', 'raw'."""
+
+    lifted_signature: Optional[LiftedFunctionSignature] = None
+    """Set in Step 9: finalized return type and LLVM attributes after interprocedural refinement."""
 
 
 @dataclass
@@ -508,6 +518,11 @@ def _serialize_function(func: Function, include_instr_locations: bool = False, i
             res['uses_frame_pointer'] = True
         if func.abi_compliance != "unknown":  # only if analyzed to something else
             res['abi_compliance'] = func.abi_compliance
+        if func.lifted_signature is not None:
+            res['lifted_signature'] = {
+                'return_type': func.lifted_signature.return_type,
+                'attributes': func.lifted_signature.attributes
+            }
     return res
 
 
@@ -747,6 +762,12 @@ def _deserialize_function(func_dict: Dict[str, Any], include_enhancements: bool 
         func.return_type = func_dict.get('return_type')  # None if missing
         func.uses_frame_pointer = func_dict.get('uses_frame_pointer', False)
         func.abi_compliance = func_dict.get('abi_compliance', "unknown")
+        if 'lifted_signature' in func_dict:
+            ls_dict = func_dict['lifted_signature']
+            func.lifted_signature = LiftedFunctionSignature(
+                return_type=ls_dict['return_type'],
+                attributes=ls_dict.get('attributes', [])
+            )
     return func
 
 
