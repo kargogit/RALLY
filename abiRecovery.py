@@ -15,7 +15,6 @@ import sys
 import json
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
-
 from astNodes import (
     legacy_program_dict_to_ast,
     ast_to_legacy_program_dict,
@@ -26,25 +25,21 @@ from astNodes import (
     ArgumentDescriptor,
     StackSlot,
 )
-
 # ---------------------------------------------------------------------------
 # Constants & Helpers
 # ---------------------------------------------------------------------------
 GP_ARG_REGS = ["RDI", "RSI", "RDX", "RCX", "R8", "R9"]
 RETURN_INT_REGS = {"RAX", "EAX", "AX", "AL"}
-
 SIZE_MAP = {
     "BYTE": 1,
     "WORD": 2,
     "DWORD": 4,
     "QWORD": 8,
-    None: 8,  # default to 8-byte when no explicit size
+    None: 8, # default to 8-byte when no explicit size
 }
-
 def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
     writes: Set[str] = set()
     reads: Set[str] = set()
-
     # Rough destination detection: first operand for most arithmetic/mov ops
     if instr.operands:
         dest_op = instr.operands[0]
@@ -56,7 +51,6 @@ def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
                 reads.add(dest_op.memory.base)
             if dest_op.memory.index:
                 reads.add(dest_op.memory.index)
-
     # Heuristic: Instructions where the first operand (destination) is ALSO a source (read).
     # Most arithmetic/logic/shift instructions read the destination value to modify it.
     # Stack (PUSH) and Control (CALL) instructions also read the first operand.
@@ -78,9 +72,7 @@ def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
         # Exchange
         "XCHG", "XADD", "CMPXCHG"
     }
-
     reads_first = instr.opcode in READS_FIRST_OPERAND
-
     # Sources (all operands)
     for i, op in enumerate(instr.operands):
         if op.register:
@@ -89,13 +81,11 @@ def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
             if i == 0 and not reads_first:
                 continue
             reads.add(op.register)
-            
         if op.memory:
             if op.memory.base:
                 reads.add(op.memory.base)
             if op.memory.index:
                 reads.add(op.memory.index)
-
     # Special cases
     if instr.opcode == "PUSH":
         writes.add("RSP")
@@ -107,9 +97,7 @@ def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
             writes.add(instr.operands[0].register)
     if instr.opcode in ("DIV", "IDIV"):
         reads.update({"RAX", "RDX"})
-
     return writes, reads
-
 # ---------------------------------------------------------------------------
 # Core Recovery Logic
 # ---------------------------------------------------------------------------
@@ -117,20 +105,16 @@ class AbiRecoverer:
     def __init__(self, program: Program):
         self.program = program
         self.symbol_table = program.symbol_table
-
     def run(self):
         """Process all internal functions."""
         for section in self.program.sections:
             for child in section.children:
                 if isinstance(child, Function) and child.entry_label:
                     self._analyze_function(child)
-
     def _analyze_function(self, func: Function):
         if not func.basic_blocks:
             return
-
         entry_bb = func.basic_blocks[0]
-
         # ----- Frame pointer / prolog detection -----
         uses_fp = False
         if len(entry_bb.instructions) >= 2:
@@ -141,13 +125,11 @@ class AbiRecoverer:
                 i1.operands[1].register == "RSP"):
                 uses_fp = True
         func.uses_frame_pointer = uses_fp
-
         # ----- Collect memory accesses and register early-use info -----
         mem_accesses: List[Tuple[int, Operand, Instruction]] = []
         defined_regs: Set[str] = set()
         early_int_arg_regs: Set[str] = set()
-
-        for bb in func.basic_blocks:  # ordered list approximates discovery/execution order
+        for bb in func.basic_blocks: # ordered list approximates discovery/execution order
             for instr in bb.instructions:
                 # Register early-use for arguments
                 writes, reads = _get_writes_reads(instr)
@@ -155,12 +137,10 @@ class AbiRecoverer:
                     if reg in GP_ARG_REGS and reg not in defined_regs:
                         early_int_arg_regs.add(reg)
                 defined_regs.update(writes)
-
                 # Memory accesses for stack args / locals
                 for op in instr.operands:
                     if op.memory and op.memory.base in ("RBP", "RSP") and isinstance(op.memory.displacement, int):
                         mem_accesses.append((op.memory.displacement, op, instr))
-
         # ----- Recover register arguments -----
         arguments: List[ArgumentDescriptor] = []
         for idx, reg in enumerate(GP_ARG_REGS):
@@ -171,10 +151,9 @@ class AbiRecoverer:
                         location=reg,
                         index=idx,
                         inferred_type="i64",
-                        first_use=None,  # could record location if desired
+                        first_use=None, # could record location if desired
                     )
                 )
-
         # ----- Recover stack-passed arguments (only with frame pointer) -----
         if uses_fp:
             positive_offsets = {disp for disp, _, _ in mem_accesses if disp > 8}
@@ -196,7 +175,6 @@ class AbiRecoverer:
                 else:
                     # Non-sequential or unexpected → stop promoting stack args
                     break
-
         # ----- Recover local stack slots (only with frame pointer, negative offsets) -----
         stack_slots: List[StackSlot] = []
         if uses_fp:
@@ -206,7 +184,6 @@ class AbiRecoverer:
                     size_str = op.size
                     size = SIZE_MAP.get(size_str, 8)
                     offset_to_sizes[disp].add(size)
-
             for off in sorted(offset_to_sizes.keys()):
                 max_size = max(offset_to_sizes[off])
                 align = max_size if max_size > 8 else 8
@@ -221,14 +198,12 @@ class AbiRecoverer:
                         index=len(stack_slots),
                     )
                 )
-
         # ----- Infer return type -----
         has_rax_write = any(
             len(i.operands) > 0 and i.operands[0].register in RETURN_INT_REGS
             for bb in func.basic_blocks
             for i in bb.instructions
         )
-
         if func.entry_label == "main":
             return_type = "i32"
             # Force canonical main signature
@@ -241,24 +216,24 @@ class AbiRecoverer:
         else:
             return_type = "i64" if has_rax_write else "void"
 
+        # Determine if the frame pointer is actually used for stack arguments or locals
+        has_stack_args = any(a.kind == "stack" for a in arguments)
+        has_locals = len(stack_slots) > 0
+
         # ----- Set ABI compliance -----
-        if func.entry_label == "main":
-            abi_compliance = "standard"
-        elif uses_fp and len([a for a in arguments if a.kind == "stack"]) == 0:
-            abi_compliance = "standard"
-        elif arguments:
+        abi_compliance = "raw"
+        if len(arguments) > 0 or uses_fp:
             abi_compliance = "partial"
-        elif stack_slots:
+        if uses_fp and (has_stack_args or has_locals):
+            abi_compliance = "standard"
+        if len(stack_slots) > 0 and not uses_fp:
             abi_compliance = "custom"
-        else:
-            abi_compliance = "raw"
 
         # ----- Annotate function -----
         func.arguments = arguments
         func.stack_slots = stack_slots
         func.return_type = return_type
         func.abi_compliance = abi_compliance
-
         # ----- Update symbol table with recovered signature -----
         if func.entry_label in self.symbol_table:
             sym = self.symbol_table[func.entry_label]
@@ -271,7 +246,6 @@ class AbiRecoverer:
             args_str = ", ".join(arg_types) if arg_types else ""
             ret = return_type or "void"
             sym["llvm_type"] = f"{ret} ({args_str})" if args_str else f"{ret} ()"
-
 # ---------------------------------------------------------------------------
 # Main Entry Point
 # ---------------------------------------------------------------------------
@@ -285,7 +259,6 @@ def main():
     except json.JSONDecodeError as jde:
         sys.stderr.write(f"Failed to parse JSON from stdin: {jde}\n")
         sys.exit(3)
-
     try:
         ast_prog: Program = legacy_program_dict_to_ast(obj, include_enhancements=True)
         recoverer = AbiRecoverer(ast_prog)
@@ -298,6 +271,5 @@ def main():
         import traceback
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
-
 if __name__ == "__main__":
     main()
