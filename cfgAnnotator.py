@@ -142,8 +142,15 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                         instr.parent = bb
                         instr_map[instr.id] = instr
 
-                        # Normalize rip-relative / got style memory displacement
+                        # Normalize operands:
+                        # 1. Convert LEA with bare label expression to RIP-relative memory (common under default rel)
+                        # 2. Then handle existing RIP/GOT memory operands
                         for op in instr.operands:
+                            if (instr.opcode.upper() == 'LEA' and
+                                getattr(op, 'expression', None) is not None and
+                                isinstance(op.expression, str)):
+                                op.memory = Memory(base='RIP', displacement=op.expression)
+                                op.expression = None
                             if isinstance(op, Operand) and op.memory is not None:
                                 mem: Memory = op.memory
                                 if isinstance(mem.base, str) and mem.base.upper() == 'RIP':
@@ -232,6 +239,16 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                 # default fallthrough
                 if idx + 1 < len(ordered_bb_ids):
                     targets.append(ordered_bb_ids[idx + 1])
+            # Annotate indirect terminators with metadata and deferred-analysis hints
+            if last_instr and last_instr.operands:
+                opc = opcode  # already uppercased
+                if is_unconditional(opc) or is_conditional(opc) or is_loop(opc) or is_call(opc):
+                    target_op = last_instr.operands[0]
+                    resolved = resolve_operand_target(target_op)
+                    if resolved is None and getattr(target_op, 'name', None) is None:
+                        # Truly indirect (register or memory target, not a direct symbol/name)
+                        last_instr.indirect_jump_kind = "unknown" if is_call(opc) else "intraprocedural"
+                        last_instr.indirect_targets = []  # Placeholder – later steps can populate via data-flow
             # Populate last_instr.target_blocks for branches (non-calls)
             if direct_target_found and not is_call(opcode):
                 instr_targets = []

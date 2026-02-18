@@ -1,5 +1,5 @@
 """
-interprocAnal.py
+interprocAnalysis.py
 Step 9: Interprocedural Propagation and Signature Finalization.
 Performs interprocedural analysis to refine operation widths, signedness,
 and pointer distinctions across function boundaries. It finalizes LLVM

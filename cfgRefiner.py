@@ -42,6 +42,24 @@ def is_jmp_opcode(opcode: str) -> bool:
 
 # ---- Helper Functions ----------------------------------------------------
 
+def is_unresolved_indirect_terminator(instr: Instruction) -> bool:
+    """Return True if the instruction is an unresolved indirect control-transfer terminator."""
+    if instr is None or is_return_opcode(instr.opcode):
+        return False
+    if len(instr.target_blocks) > 0 or len(instr.indirect_targets) > 0:
+        return False
+    if is_call_opcode(instr.opcode):
+        if get_call_target_name(instr) is not None:
+            return False
+    return True
+
+def has_unresolved_indirect_terminators(func: Function) -> bool:
+    """Return True if the function contains any unresolved indirect terminator."""
+    for bb in func.basic_blocks:
+        if bb.terminator and is_unresolved_indirect_terminator(bb.terminator):
+            return True
+    return False
+
 def get_function_containing_bb(bb: BasicBlock, program: Program) -> Optional[Function]:
     """Finds the parent Function of a BasicBlock."""
     # Check parent reference first if populated by Step 4
@@ -70,6 +88,29 @@ def get_call_target_name(instr: Instruction) -> Optional[str]:
     if op.symbol_ref and isinstance(op.symbol_ref, Label):
         return op.symbol_ref.name
     return None
+
+def classify_call_target(instr: Instruction, func_map: Dict[str, Function]) -> Optional[str]:
+    """
+    Classify a CALL instruction target as:
+    - 'internal': Direct call to a function defined within the program (target_blocks populated)
+    - 'external': Direct call to an external symbol (e.g., PLT call to printf/exit)
+    - 'indirect': Indirect call via register or memory (function pointer)
+    - None: Not a call instruction
+    """
+    if not is_call_opcode(instr.opcode):
+        return None
+
+    # Check for internal direct call (target_blocks points to entry BB of internal function)
+    if instr.target_blocks:
+        return "internal"
+
+    # Check for external direct call (has symbol name but no target_blocks)
+    if get_call_target_name(instr) is not None:
+        return "external"
+
+    # Otherwise, it's an indirect call (e.g., call rax, call [mem])
+    return "indirect"
+
 
 def resolve_target_function(instr: Instruction, func_map: Dict[str, Function]) -> Optional[Function]:
     """
@@ -107,6 +148,19 @@ def analyze_noreturn_behavior(program: Program):
                 for bb in child.basic_blocks:
                     bb_map[bb.id] = bb
 
+    # Annotate call target classifications
+    # This must happen before any analysis that depends on it
+    for func in func_map.values():
+        for bb in func.basic_blocks:
+            for instr in bb.instructions:
+                instr.call_target_kind = classify_call_target(instr, func_map)
+
+    # Detect functions with unresolved indirect terminators (defer their analysis/pruning)
+    deferred_funcs: Set[str] = set()
+    for fid, func in func_map.items():
+        if has_unresolved_indirect_terminators(func):
+            deferred_funcs.add(fid)
+
     # 2. Initialize Noreturn Status
     # status: func_id (or external name) -> bool (True if noreturn)
     noreturn_status: Dict[str, bool] = {}
@@ -120,7 +174,7 @@ def analyze_noreturn_behavior(program: Program):
         noreturn_status[func_id] = False
 
     # 3. Worklist Algorithm for Noreturn Detection
-    worklist: Deque[str] = deque(func_map.keys())
+    worklist: Deque[str] = deque(fid for fid in func_map.keys() if fid not in deferred_funcs)
     
     # Cache of function entry block IDs
     func_entry_bb_id: Dict[str, str] = {}
@@ -231,18 +285,22 @@ def analyze_noreturn_behavior(program: Program):
             # Since we don't have a full call graph, we just re-queue everyone
             # or scan. Re-queueing everyone is safer and reasonably fast for small/med programs.
             for other_fid in func_map:
-                if other_fid != fid:
+                if other_fid != fid and other_fid not in deferred_funcs:
                     worklist.append(other_fid)
 
     # 4. Annotate Functions
     for fid, func in func_map.items():
-        if noreturn_status[fid]:
+        if fid in deferred_funcs:
+            func.noreturn_kind = "pending_resolution"
+        elif noreturn_status.get(fid, False):
             func.noreturn_kind = "noreturn"
         else:
             func.noreturn_kind = None # Explicitly clear if needed
 
     # 5. Prune Spurious Fall-Through Edges
     for func in func_map.values():
+        if func.id in deferred_funcs:
+            continue  # Skip pruning in deferred functions to retain conservative fall-through
         bb_list = func.basic_blocks
         for i, bb in enumerate(bb_list):
             term = bb.terminator

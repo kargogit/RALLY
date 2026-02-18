@@ -188,10 +188,18 @@ class Instruction(ASTNode):
     target_blocks: List['BasicBlock'] = field(default_factory=list)
     """List of target BasicBlock objects for branch/call instructions. In typed AST: object references; in legacy dict: list of string ids."""
 
+    indirect_targets: List['BasicBlock'] = field(default_factory=list)  # Placeholder for future possible targets
+
+    indirect_jump_kind: Optional[str] = None  # 'intraprocedural' or 'unknown'
+
     id: Optional[str] = None
     """Synthetic unique identifier (e.g., 'instr_42'). Populated when include_enhancements=True; serialized as string."""
 
     op_refinement: Optional[str] = None  # e.g., 'i32_unsigned', 'f64'; for operation-specific width/signedness/float
+
+    call_target_kind: Optional[str] = None  # 'internal' | 'external' | 'indirect' | 'unresolved'
+
+    indirect_targets_over_approximated: bool = False
 
 
 @dataclass
@@ -356,8 +364,8 @@ def _serialize_stack_slot(ss: StackSlot, include_enhancements: bool = False) -> 
     if ss.register is not None:
         res['register'] = ss.register
     if include_enhancements:
-        if ss.refinement is not None:
-            res['refinement'] = ss.refinement
+        if ss.inferred_type is not None:
+            res['inferred_type'] = ss.inferred_type
     return res
 
 
@@ -454,10 +462,18 @@ def _serialize_instruction(instr: Instruction, include_instr_locations: bool = F
         if instr.id is not None:
             res['id'] = instr.id
         res['target_blocks'] = [tb.id for tb in instr.target_blocks]
+        if instr.indirect_targets:
+            res['indirect_targets'] = [it.id for it in instr.indirect_targets]
+        if instr.indirect_jump_kind is not None:
+            res['indirect_jump_kind'] = instr.indirect_jump_kind
         if instr.parent:
             res['parent'] = instr.parent.id
         if instr.op_refinement is not None:
             res['op_refinement'] = instr.op_refinement
+        if instr.call_target_kind is not None:
+            res['call_target_kind'] = instr.call_target_kind
+        if getattr(instr, 'indirect_targets_over_approximated', False):
+            res['indirect_targets_over_approximated'] = True
     return res
 
 
@@ -699,7 +715,11 @@ def _deserialize_instruction(instr_dict: Dict[str, Any], include_enhancements: b
     if include_enhancements:
         instr.id = instr_dict.get('id')
         instr._temp_target_blocks = instr_dict.get('target_blocks', [])
+        instr.indirect_jump_kind = instr_dict.get('indirect_jump_kind')
+        instr._temp_indirect_targets = instr_dict.get('indirect_targets', [])
         instr.op_refinement = instr_dict.get('op_refinement')
+        instr.call_target_kind = instr_dict.get('call_target_kind')
+        instr.indirect_targets_over_approximated = instr_dict.get('indirect_targets_over_approximated', False)
     return instr
 
 
@@ -930,7 +950,10 @@ def legacy_program_dict_to_ast(program_dict: Dict[str, Any], include_enhancement
                             if hasattr(instr, '_temp_target_blocks'):
                                 instr.target_blocks = [bb_map[tb_id] for tb_id in instr._temp_target_blocks if tb_id in bb_map]
                                 del instr._temp_target_blocks
-
+                            # Resolve indirect_targets (placeholder, usually empty initially)
+                            if hasattr(instr, '_temp_indirect_targets'):
+                                instr.indirect_targets = [bb_map[tid] for tid in instr._temp_indirect_targets if tid in bb_map]
+                                del instr._temp_indirect_targets
                             # Resolve operand symbol_refs
                             for op in instr.operands:
                                 _resolve_symbol_ref(op, label_map)
