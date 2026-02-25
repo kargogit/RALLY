@@ -6,12 +6,11 @@ Usage:
     cat primitiveAST.json | python partitionAST.py > enhancedAST.json
 """
 
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple, Set, Iterable
 import itertools
 import uuid
 import dataclasses
 import re
-from typing import Iterable
 
 # Import dataclasses/types from astNodes.py (must be in same PYTHONPATH)
 from astNodes import (
@@ -123,6 +122,9 @@ def _collect_label_references_from_sections(sections: Iterable[Section]) -> Set[
             else:
                 # For any other child node (could be a 'function-node' etc), inspect generically
                 _extract_label_names_from_obj(child, found)
+        # Also scan pseudo_instruct for data directives (e.g. in .init_array)
+        for item in getattr(sec, 'pseudo_instruct', []) or []:
+            _extract_label_names_from_obj(item, found)
     return found
 
 
@@ -334,12 +336,15 @@ def _identify_function_entry_labels(
     linear_stream: List[Tuple[str, Any]],
     program_globals: List[str],
     program_sections: Optional[Iterable[Section]] = None
-) -> Set[str]:
+) -> Dict[str, bool]:
     """
     Heuristic: function entry labels come from:
       - program globals (explicit)
       - call targets found in the linear_stream (call instructions)
       - label references embedded in data sections (.init_array/.fini_array etc)
+
+    Returns a dict mapping label_name -> is_boundary.
+    is_boundary is True if global, main/_start, or referenced in init/fini arrays.
     """
     globals_set = set(program_globals or [])
     call_targets: Set[str] = set()
@@ -354,14 +359,29 @@ def _identify_function_entry_labels(
     }
 
     data_references: Set[str] = set()
+    init_fini_references: Set[str] = set()
+
     if program_sections is not None:
         try:
             data_references = _collect_label_references_from_sections(program_sections)
+            # Specifically scan init/fini/preinit arrays for boundary classification
+            init_fini_sections = {'.init_array', '.fini_array', '.preinit_array'}
+            for sec in program_sections:
+                if sec.name in init_fini_sections:
+                    for child in getattr(sec, 'children', []) or []:
+                        _extract_label_names_from_obj(child, init_fini_references)
+                    for item in getattr(sec, 'pseudo_instruct', []) or []:
+                        _extract_label_names_from_obj(item, init_fini_references)
         except Exception:
             data_references = set()
+            init_fini_references = set()
 
     candidates = (globals_set | call_targets | data_references) & label_names_in_stream
-    return candidates
+
+    # Determine boundary status
+    boundary_candidates = (globals_set | init_fini_references | {'main', '_start'}) & candidates
+
+    return {name: (name in boundary_candidates) for name in candidates}
 
 
 def _split_linear_stream_into_function_segments(
@@ -399,7 +419,7 @@ def _split_linear_stream_into_function_segments(
     return segments
 
 
-def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_globals: List[str], bb_id_counter: itertools.count) -> Optional[Function]:
+def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_globals: List[str], bb_id_counter: itertools.count, entry_boundary_map: Dict[str, bool]) -> Optional[Function]:
     """
     Partition a function segment into BasicBlocks and return a Function.
     Correctly calculates source location ranges for blocks and the function.
@@ -505,6 +525,7 @@ def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_glo
     func = Function(basic_blocks=basic_blocks)
     if entry_label:
         func.entry_label = entry_label
+        func.is_boundary = entry_boundary_map.get(entry_label, False)
 
     # --- Source Location Calculation for Function ---
     # Spans from first BasicBlock start to last BasicBlock end
@@ -531,7 +552,8 @@ def partition_program_into_functions_and_basic_blocks(program: Program) -> Progr
             continue
 
         linear_stream = _flatten_section_labelgroups(sec)
-        entry_candidates = _identify_function_entry_labels(linear_stream, program.globals or [], program.sections)
+        entry_boundary_map = _identify_function_entry_labels(linear_stream, program.globals or [], program.sections)
+        entry_candidates = set(entry_boundary_map.keys())
         segments = _split_linear_stream_into_function_segments(linear_stream, entry_candidates)
 
         if not segments and linear_stream:
@@ -539,7 +561,7 @@ def partition_program_into_functions_and_basic_blocks(program: Program) -> Progr
 
         new_children: List[Any] = []
         for seg in segments:
-            func = _partition_segment_into_function(seg, program.globals or [], bb_id_counter)
+            func = _partition_segment_into_function(seg, program.globals or [], bb_id_counter, entry_boundary_map)
             if func is not None:
                 new_children.append(func)
             else:

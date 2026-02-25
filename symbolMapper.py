@@ -119,6 +119,7 @@ class SymbolMapper:
                 if isinstance(child, Function):
                     if child.entry_label:
                         entry = self._ensure_symbol_entry(child.entry_label, 'function')
+                        entry['kind'] = 'function'
                         if child.entry_label == 'main':
                             entry['llvm_type'] = 'i32 (i32, i8**)'
                         elif child.entry_label == 'double_val':
@@ -131,6 +132,13 @@ class SymbolMapper:
                             entry['visibility'] = 'global'
                             entry['linkage'] = 'external'
                         entry['is_definition'] = True
+
+                        # Boundary functions
+                        if getattr(child, 'is_boundary', False):
+                            entry['is_boundary'] = True
+                            # Dual references per spec (wrapper = public ABI name; lifted = internal %State* version)
+                            entry['wrapper_ref'] = child.entry_label
+                            entry['lifted_ref'] = f"{child.entry_label}_lifted"
 
                     for bb in child.basic_blocks:
                         if bb.start_label:
@@ -152,8 +160,8 @@ class SymbolMapper:
     def _process_ctors_dtors(self):
         """
         Maps .init_array/.fini_array to llvm.global_ctors / llvm.global_dtors.
-        After mapping, these sections are removed from the program AST to prevent
-        duplicate intent, as the information is now canonicalized in the symbol table.
+        REMAPPED: initializer pointers now reference public wrapper symbols (not the lifted versions).
+        Sections are removed after canonicalization.
         """
         def handle_array(sec_name: str, llvm_global: str):
             sec = self.section_map.get(sec_name)
@@ -164,7 +172,14 @@ class SymbolMapper:
                 if pseudo.get('dx') in ('dq', 'dd'):  # tolerant
                     for val in pseudo.get('values', []):
                         if isinstance(val, dict) and 'symbol' in val:
-                            pointers.append(val['symbol'])
+                            sym_name = val['symbol']
+                            # Remap to wrapper_ref for boundary functions
+                            sym_entry = self.symbol_table.get(sym_name, {})
+                            if sym_entry.get('is_boundary'):
+                                p = sym_entry.get('wrapper_ref', sym_name)
+                            else:
+                                p = sym_name
+                            pointers.append(p)
             if pointers:
                 entry = self._ensure_symbol_entry(llvm_global, 'special')
                 entry['linkage'] = 'appending'
@@ -219,6 +234,63 @@ class SymbolMapper:
         if current_label and directives_buffer:
             self._commit_symbol_data(current_label, directives_buffer, section_name)
 
+    def _commit_symbol_data(self, name: str, directives: List[DataDirective], section_name: str):
+        """
+        Processes a list of DataDirectives into a symbol table entry.
+        Applies the same fixes as _commit_legacy_data:
+        1. is_constant only for .rodata.
+        2. Single values (even bytes) emitted as scalars, not [1 x type].
+        """
+        if not directives:
+            return
+
+        flat_values: List[Any] = []
+        # Determine type hint from first directive
+        first_kind = directives[0].kind.lower()
+        type_hint = LLVM_INT_TYPES.get(first_kind, 'i8')
+        is_float = first_kind in LLVM_FLOAT_TYPES
+        if is_float:
+            type_hint = LLVM_FLOAT_TYPES[first_kind]
+
+        for dd in directives:
+            for op in dd.operands:
+                if isinstance(op, Immediate):
+                    flat_values.append(op.value)
+                elif isinstance(op, str):
+                    # String literal
+                    s = op.strip('"')
+                    for c in s:
+                        flat_values.append(ord(c))
+                elif isinstance(op, Expression):
+                    # Complex expression - skipped for simple value derivation
+                    pass
+
+        entry = self._ensure_symbol_entry(name, 'data')
+        entry['section'] = section_name
+        # FIX 1: Only set is_constant for .rodata. .data is writable.
+        if section_name == '.rodata':
+            entry['is_constant'] = True
+
+        string_const = self._format_string_constant(flat_values)
+        if string_const is not None:
+            entry['value'] = string_const
+            entry['llvm_type'] = f'[{len(flat_values)} x i8]'
+            # Removed: entry['is_constant'] = True (Fix 1)
+        # FIX 2: Emit single values as scalars (including single bytes).
+        elif len(flat_values) == 1:
+            entry['llvm_type'] = type_hint
+            entry['value'] = format_llvm_constant(flat_values[0], type_hint)
+        else:
+            entry['llvm_type'] = f'[{len(flat_values)} x {type_hint}]'
+            formatted_vals = [format_llvm_constant(v, type_hint) for v in flat_values]
+            entry['value'] = f'[ {", ".join(formatted_vals)} ]'
+
+        if name in self.program.globals:
+            entry['visibility'] = 'global'
+            entry['linkage'] = 'global'
+        else:
+            entry['linkage'] = 'internal'
+
     def _parse_legacy_pseudo_data(self, sec: Section, section_name: str):
         """Handles data present in pseudo_instruct (seen in sample input)."""
         for pseudo in sec.pseudo_instruct:
@@ -234,7 +306,7 @@ class SymbolMapper:
             integer_val = pseudo.get('integer')
 
             if equ:
-                # Fix 1: Explicitly force kind to 'constant' to override any incorrect 'data' classification from input
+                # Explicitly force kind to 'constant' to override any incorrect 'data' classification from input
                 entry = self._ensure_symbol_entry(name, 'constant')
                 entry['kind'] = 'constant'
                 entry['visibility'] = 'local'
@@ -299,7 +371,7 @@ class SymbolMapper:
         for v in values:
             if isinstance(v, dict):
                 if 'string' in v:
-                    # Fix 4: Ensure string parsing is robust. 
+                    # Ensure string parsing is robust.
                     # The input AST often has the string content quoted: "\"...\""
                     # We need to strip the outer quotes to get the actual content bytes.
                     s = v['string'].strip('"')
@@ -324,8 +396,9 @@ class SymbolMapper:
         if string_const is not None:
             entry['value'] = string_const
             entry['llvm_type'] = f'[{len(flat_values)} x i8]'
-            entry['is_constant'] = True
-        elif len(flat_values) == 1 and kind.lower() != 'db':
+            # Removed: entry['is_constant'] = True
+            # Emit single values as scalars (including single bytes).
+        elif len(flat_values) == 1:
             entry['llvm_type'] = type_hint
             entry['value'] = format_llvm_constant(flat_values[0], type_hint)
         else:
@@ -357,7 +430,7 @@ class SymbolMapper:
                                     continue
 
                                 sym = self.symbol_table[sym_name]
-                                # Fix 2: Constants (equ) generate no relocations.
+                                # Constants (equ) generate no relocations.
                                 # This check now works because we fixed the 'kind' to 'constant' in _parse_legacy_pseudo_data.
                                 if sym.get('kind') == 'constant':
                                     continue  # immediates need no relocation
@@ -372,7 +445,7 @@ class SymbolMapper:
                                     else:
                                         continue  # internal direct call/branch – no relocation
                                 elif sym.get('kind') == 'data':
-                                    # Fix 3: Prioritize GOT access over generic RIP-relative access.
+                                    # Prioritize GOT access over generic RIP-relative access.
                                     if op.via_got:
                                         reloc_type = 'gotpcrel'
                                         pic = True

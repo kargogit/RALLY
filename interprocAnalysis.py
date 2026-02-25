@@ -1,19 +1,18 @@
 """
 interprocAnalysis.py
-Step 9: Interprocedural Propagation and Signature Finalization.
-Performs interprocedural analysis to refine operation widths, signedness,
-and pointer distinctions across function boundaries. It finalizes LLVM
-function signatures (ret_type (%State*)) and attributes like 'noreturn'.
-Inputs: Enriched AST from Step 8 (via stdin JSON).
-Outputs: Enriched AST with finalized 'lifted_signature' on each Function
- and propagated refinements (via stdout JSON).
+Step 9: Interprocedural Propagation and Signature Finalization (Revised).
+Performs targeted interprocedural refinement of widths, signedness, pointer
+distinctions and scalar FP types. Finalizes dual signatures:
+  - 'lifted_signature' (ret_type (%State*)) for EVERY function (void if noreturn)
+  - 'external_abi_signature' for boundary functions only (refined from Step 7
+    while preserving standard structure).
+Includes noreturn propagation + CFG pruning of fall-through edges.
+Inputs/Outputs: Enriched AST (JSON via stdin/stdout).
 """
 import sys
 import json
-import copy
-from typing import Dict, List, Set, Optional, Any, Tuple
+from typing import Dict, List, Set, Optional, Any
 from collections import defaultdict
-# Assuming astNodes.py is available in the environment or path
 from astNodes import (
     legacy_program_dict_to_ast,
     ast_to_legacy_program_dict,
@@ -21,38 +20,34 @@ from astNodes import (
     Function,
     BasicBlock,
     Instruction,
-    Operand,
     LiftedFunctionSignature
 )
 # ---------------------------------------------------------------------------
-# Type System (Reused/Adapted from Step 8)
+# Type System (improved for FP, ptr retention, void)
 # ---------------------------------------------------------------------------
 class TypeRef:
-    """Represents a type constraint (width, signedness, float, ptr)."""
     def __init__(self, width: int, is_float: bool, is_ptr: bool, signed: Optional[bool] = None):
         self.width = width
         self.is_float = is_float
         self.is_ptr = is_ptr
         self.signed = signed
-
     @staticmethod
     def unknown() -> 'TypeRef':
         return TypeRef(0, False, False, None)
-
     @staticmethod
     def from_string(s: Optional[str]) -> 'TypeRef':
-        if not s:
+        if not s or s == 'unknown':
             return TypeRef.unknown()
-        if s == 'ptr':
-            return TypeRef(0, False, True, None)
+        if s == 'ptr' or s.startswith('i8*'):
+            return TypeRef(64, False, True, None)
         if s == 'void':
-            return TypeRef(0, False, False, None)  # Special case
-        if s == 'f32':
+            return TypeRef(0, False, False, None)
+        if s in ('f32', 'float'):
             return TypeRef(32, True, False, None)
-        if s == 'f64':
+        if s in ('f64', 'double'):
             return TypeRef(64, True, False, None)
-        base = s
         signed = None
+        base = s
         if s.endswith('_signed'):
             signed = True
             base = s[:-7]
@@ -62,58 +57,45 @@ class TypeRef:
         if base.startswith('i') and base[1:].isdigit():
             return TypeRef(int(base[1:]), False, False, signed)
         return TypeRef.unknown()
-
     def to_string(self) -> str:
-        if self.is_ptr: return 'ptr'
+        if self.is_ptr:
+            return 'ptr'
         if self.is_float:
             return 'float' if self.width == 32 else 'double'
         suffix = ''
-        if self.signed is True: suffix = '_signed'
-        elif self.signed is False: suffix = '_unsigned'
-        return f"i{self.width}{suffix}"
-
-    def __repr__(self):
-        return self.to_string()
-
-    def is_unknown(self):
-        return not self.is_ptr and not self.is_float and self.width == 0 and self.signed is None
-
+        if self.signed is True:
+            suffix = '_signed'
+        elif self.signed is False:
+            suffix = '_unsigned'
+        return f"i{self.width}{suffix}" if self.width > 0 else 'unknown'
+    def is_unknown(self) -> bool:
+        return self.width == 0 and not self.is_ptr and not self.is_float and self.signed is None
 def meet(t1: Optional[TypeRef], t2: Optional[TypeRef]) -> TypeRef:
-    """Lattice meet: returns the least upper bound (widest safe type)."""
-    if t1 is None: return t2 if t2 else TypeRef.unknown()
-    if t2 is None: return t1
-    # Handle void/unknown as top
-    if t1.is_unknown(): return t2
-    if t2.is_unknown(): return t1
-    # If one is ptr and other is not, we can't safely merge (unless we treat ptr as i64, but here we distinguish)
-    if t1.is_ptr != t2.is_ptr:
-        return TypeRef.unknown()
+    """Lattice LUB (widen on conflict). Retains ptr on i64 conflict per spec."""
+    if t1 is None or t1.is_unknown():
+        return t2 or TypeRef.unknown()
+    if t2 is None or t2.is_unknown():
+        return t1
     if t1.is_ptr and t2.is_ptr:
-        return t1  # pointers are consistent
+        return TypeRef(64, False, True, None)
+    if t1.is_ptr != t2.is_ptr:
+        return TypeRef(64, False, True, None) # conservative ptr semantics
     if t1.is_float and t2.is_float:
         return t1 if t1.width == t2.width else TypeRef.unknown()
     if t1.is_float != t2.is_float:
         return TypeRef.unknown()
-    # Integer merge
-    # Widen width
-    new_width = max(t1.width, t2.width)
-    # Merge signedness: if conflict, drop signedness (unknown signedness)
-    new_signed = None
-    if t1.signed == t2.signed:
-        new_signed = t1.signed
+    new_width = max(t1.width or 64, t2.width or 64)
+    new_signed = t1.signed if t1.signed == t2.signed else None
     return TypeRef(new_width, False, False, new_signed)
-
 # ---------------------------------------------------------------------------
-# System V ABI / External Function Helpers
+# ABI / External helpers
 # ---------------------------------------------------------------------------
-# Map of canonical register names to argument indices (System V AMD64)
 INT_ARGS = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9']
-XMM_ARGS = ['XMM0', 'XMM1', 'XMM2', 'XMM3', 'XMM4', 'XMM5', 'XMM6', 'XMM7']
-
+XMM_ARGS = [f'XMM{i}' for i in range(8)]
 def get_canonical_reg(reg: str) -> Optional[str]:
-    if not reg: return None
+    if not reg:
+        return None
     r = reg.upper()
-    # Simple mapping for standard regs
     map_rules = {
         'RAX': 'RAX', 'EAX': 'RAX', 'AX': 'RAX', 'AL': 'RAX',
         'RBX': 'RBX', 'EBX': 'RBX', 'BX': 'RBX', 'BL': 'RBX',
@@ -125,270 +107,245 @@ def get_canonical_reg(reg: str) -> Optional[str]:
         'R9': 'R9', 'R9D': 'R9', 'R9W': 'R9', 'R9B': 'R9',
         'RSP': 'RSP', 'RBP': 'RBP'
     }
-    if r in map_rules: return map_rules[r]
-    if r.startswith('XMM'): return r  # XMM0-15
-    return None
-
+    return map_rules.get(r) or (r if r.startswith('XMM') else None)
 class ExternalABIDB:
-    """Knowledge base for known external functions."""
-    # Known signatures: (ret_type, [arg_types...])
-    # None for ret means void/noreturn usually, specific check required
     KNOWN = {
-        'printf': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None)]},  # i32 (i8*, ...) - variadic
+        'printf': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None)]},
         'fprintf': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None), TypeRef(0, False, True, None)]},
         'scanf': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None)]},
         'puts': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None)]},
-        'malloc': {'ret': TypeRef(0, False, True, None), 'args': [TypeRef(64, False, False, True)]},  # void* (size_t)
-        'free': {'ret': TypeRef(0, False, False, None), 'args': [TypeRef(0, False, True, None)]},  # void (void*)
-        'exit': {'ret': None, 'args': [TypeRef(32, False, False, True)], 'noreturn': True},  # void (i32)
+        'malloc': {'ret': TypeRef(0, False, True, None), 'args': [TypeRef(64, False, False, True)]},
+        'free': {'ret': TypeRef(0, False, False, None), 'args': [TypeRef(0, False, True, None)]},
+        'exit': {'ret': None, 'args': [TypeRef(32, False, False, True)], 'noreturn': True},
         'abort': {'ret': None, 'args': [], 'noreturn': True},
-        'sqrt': {'ret': TypeRef(64, True, False, None), 'args': [TypeRef(64, True, False, None)]},  # double (double)
+        'sqrt': {'ret': TypeRef(64, True, False, None), 'args': [TypeRef(64, True, False, None)]},
     }
-
     @staticmethod
     def get(name: str) -> Optional[Dict]:
         return ExternalABIDB.KNOWN.get(name)
-
-# ---------------------------------------------------------------------------
-# Analysis Logic
-# ---------------------------------------------------------------------------
 class CallSite:
     def __init__(self, caller: Function, instr: Instruction, target_name: str, is_external: bool):
         self.caller = caller
         self.instr = instr
-        self.target_name = target_name  # Name of function (string)
+        self.target_name = target_name
         self.is_external = is_external
-
 class InterproceduralAnalyzer:
     def __init__(self, program: Program):
         self.program = program
-        self.functions: Dict[str, Function] = {}  # id -> Function
-        self.call_graph: List[CallSite] = []  # List of all calls
-        self.reverse_call_graph: Dict[str, List[CallSite]] = defaultdict(list)  # target_name -> CallSites
-        # Constraints per function (accumulated during fixed point)
-        self.func_constraints: Dict[str, Dict] = defaultdict(lambda: {
-            'ret': TypeRef.unknown(),
-            'args': []  # List of TypeRef
-        })
+        self.functions: Dict[str, Function] = {}
+        self.call_graph: List[CallSite] = []
+        self.reverse_call_graph: Dict[str, List[CallSite]] = defaultdict(list)
+        self.func_constraints: Dict[str, Dict] = defaultdict(
+            lambda: {'ret': TypeRef.unknown(), 'args': [TypeRef.unknown() for _ in range(6)]}
+        )
         self._collect_functions()
-
     def _collect_functions(self):
         for sec in self.program.sections:
             for child in sec.children:
                 if isinstance(child, Function):
                     self.functions[child.id] = child
-                    # Initialize constraints from Step 7 ABI info if present
-                    arg_constraints = []
-                    for i in range(6):  # Cap at 6 standard regs for initialization
-                        arg_constraints.append(TypeRef.unknown())
-                    # Override with Step 7 specific types if available
-                    if child.arguments:
-                        for arg in child.arguments:
-                            if arg.kind == 'register':
-                                # Map to index if possible
-                                try:
-                                    idx = INT_ARGS.index(arg.location.upper())
-                                    t = TypeRef.from_string(arg.inferred_type)
-                                    if t.is_unknown(): t = TypeRef(64, False, False, None)
-                                    if idx < len(arg_constraints):
-                                        arg_constraints[idx] = t
-                                except ValueError:
-                                    pass
+                    # Step 7 ABI seeds
+                    arg_constraints = [TypeRef.unknown() for _ in range(6)]
+                    for arg in child.arguments:
+                        if arg.kind == 'register':
+                            try:
+                                idx = INT_ARGS.index(arg.location.upper())
+                                t = TypeRef.from_string(arg.inferred_type)
+                                if idx < len(arg_constraints):
+                                    arg_constraints[idx] = t
+                            except ValueError:
+                                pass
                     self.func_constraints[child.id]['args'] = arg_constraints
-                    # Init ret type
-                    rt = TypeRef.from_string(child.return_type)
-                    if rt.is_unknown() and not child.noreturn_kind and child.return_type != 'void':
-                        rt = TypeRef(64, False, False, None)  # Default i64
-                    self.func_constraints[child.id]['ret'] = rt
-
+                    # Respect explicit 'void' from Step 7 ABI recovery
+                    # (critical for bare-RET ELF ctors/dtors and other void funcs).
+                    # Prevents default-to-i64 heuristic when there is zero evidence
+                    # of a return value (no RAX definition, no internal callers).
+                    # Guarantees preservation of standard-enforced signatures.
+                    if child.return_type == 'void':
+                        self.func_constraints[child.id]['ret'] = TypeRef(0, False, False, None)
+                    else:
+                        rt = TypeRef.from_string(child.return_type)
+                        self.func_constraints[child.id]['ret'] = rt if not rt.is_unknown() else TypeRef(64, False, False, None)
     def build_call_graph(self):
         for func in self.functions.values():
             for bb in func.basic_blocks:
                 for instr in bb.instructions:
-                    if instr.opcode.upper() == 'CALL':
-                        if not instr.operands:
-                            continue
-                        # Target is typically op 0
+                    if instr.opcode.upper() == 'CALL' and instr.operands:
                         target = instr.operands[0]
-                        name = None
-                        is_ext = False
-                        if target.name:
-                            name = target.name
-                            # Check if internal
-                            found = False
-                            for f_id, f_obj in self.functions.items():
-                                if f_obj.entry_label == name:
-                                    name = f_obj.entry_label  # Normalize to entry label
-                                    found = True
-                                    break
-                            if not found:
-                                is_ext = True
-                        elif target.symbol_ref:
-                            name = target.symbol_ref.name
-                            # Check if internal label
-                            if any(f.entry_label == name for f in self.functions.values()):
-                                is_ext = False
-                            else:
-                                is_ext = True
+                        name = target.name or (target.symbol_ref.name if getattr(target, 'symbol_ref', None) else None)
                         if name:
+                            is_ext = name not in {f.entry_label for f in self.functions.values()}
                             cs = CallSite(func, instr, name, is_ext)
                             self.call_graph.append(cs)
                             self.reverse_call_graph[name].append(cs)
-
-    def _find_type_passed_at_call(self, cs: CallSite, arg_idx: int) -> Optional[TypeRef]:
-        """Heuristic: Scan backwards in the BasicBlock to find the instruction that sets the register corresponding to arg_idx."""
-        target_reg = None
+    def _find_type_passed_at_call(self, cs: CallSite, arg_idx: int) -> TypeRef:
         if arg_idx < len(INT_ARGS):
             target_reg = INT_ARGS[arg_idx]
+        elif arg_idx < len(XMM_ARGS):
+            target_reg = XMM_ARGS[arg_idx]
         else:
             return TypeRef.unknown()
-        actual_bb = cs.instr.parent
-        if not actual_bb: return TypeRef.unknown()
-        instr_list = actual_bb.instructions
+        bb = cs.instr.parent
+        if not bb:
+            return TypeRef.unknown()
         try:
-            call_idx = instr_list.index(cs.instr)
+            call_idx = bb.instructions.index(cs.instr)
         except ValueError:
             return TypeRef.unknown()
         for i in range(call_idx - 1, -1, -1):
-            prev_instr = instr_list[i]
-            if prev_instr.operands and len(prev_instr.operands) > 0:
-                dst = prev_instr.operands[0]
-                if dst.register and get_canonical_reg(dst.register) == target_reg:
-                    if prev_instr.op_refinement:
-                        return TypeRef.from_string(prev_instr.op_refinement)
-                    w = 64
-                    r = dst.register.upper()
-                    if 'D' in r and r not in ['RDI', 'RDX']: w = 32
-                    elif 'W' in r: w = 16
-                    elif 'B' in r or 'L' in r: w = 8
-                    return TypeRef(w, False, False, None)
-                if target_reg.startswith('XMM') and dst.register:
-                    if dst.register.upper() == target_reg:
-                        if prev_instr.op_refinement:
-                            return TypeRef.from_string(prev_instr.op_refinement)
-                        return TypeRef(128, True, False, None)
-        # Not found in immediate block. Check caller's args
+            prev = bb.instructions[i]
+            if prev.operands and prev.operands[0].register:
+                if get_canonical_reg(prev.operands[0].register) == target_reg:
+                    if prev.op_refinement:
+                        t = TypeRef.from_string(prev.op_refinement)
+                        return t if not (target_reg.startswith('XMM') and not t.is_float) else TypeRef(64, True, False, None)
         if arg_idx < len(cs.caller.arguments):
-            arg_desc = cs.caller.arguments[arg_idx]
-            return TypeRef.from_string(arg_desc.inferred_type)
+            return TypeRef.from_string(cs.caller.arguments[arg_idx].inferred_type)
         return TypeRef.unknown()
-
-    def _find_return_usage_at_call(self, cs: CallSite) -> Optional[TypeRef]:
-        """Scan forwards from the call to see how RAX (or XMM0) is used."""
-        actual_bb = cs.instr.parent
-        if not actual_bb: return TypeRef.unknown()
-        instr_list = actual_bb.instructions
+    def _find_return_usage_at_call(self, cs: CallSite) -> TypeRef:
+        bb = cs.instr.parent
+        if not bb:
+            return TypeRef.unknown()
         try:
-            call_idx = instr_list.index(cs.instr)
+            call_idx = bb.instructions.index(cs.instr)
         except ValueError:
             return TypeRef.unknown()
-        for i in range(call_idx + 1, len(instr_list)):
-            next_instr = instr_list[i]
-            uses_ret = False
-            for op in next_instr.operands:
+        for i in range(call_idx + 1, len(bb.instructions)):
+            nxt = bb.instructions[i]
+            for op in nxt.operands:
                 if op.register:
                     canon = get_canonical_reg(op.register)
-                    if canon == 'RAX' or op.register.upper() == 'XMM0':
-                        uses_ret = True
-                        if op == next_instr.operands[0]:  # Is def
-                            if next_instr.op_refinement:
-                                return TypeRef.from_string(next_instr.op_refinement)
-                            w = 64
-                            if 'D' in op.register.upper(): w = 32
-                            elif 'W' in op.register.upper(): w = 16
-                            elif 'B' in op.register.upper(): w = 8
-                            return TypeRef(w, False, False, None)
-            if uses_ret:
-                return TypeRef(64, False, False, None)
-            if next_instr.opcode.upper() in ['RET', 'JMP', 'CALL']:
+                    if canon == 'RAX' or op.register.upper().startswith('XMM0'):
+                        if nxt.op_refinement:
+                            t = TypeRef.from_string(nxt.op_refinement)
+                            return t if not op.register.upper().startswith('XMM') else (t if t.is_float else TypeRef(64, True, False, None))
+            if nxt.opcode.upper() in ('RET', 'JMP', 'CALL'):
                 break
         return TypeRef.unknown()
-
+    def _prune_noreturn_fallthrough(self):
+        """Prune spurious fall-through after calls to (newly) noreturn functions."""
+        noreturn_targets = {name for name, info in ExternalABIDB.KNOWN.items() if info.get('noreturn')}
+        for f in self.functions.values():
+            if (f.noreturn_kind == 'noreturn' or
+                (f.lifted_signature and 'noreturn' in f.lifted_signature.attributes)):
+                if f.entry_label:
+                    noreturn_targets.add(f.entry_label)
+        for cs in self.call_graph:
+            if cs.target_name in noreturn_targets:
+                bb = cs.instr.parent
+                if bb and bb.successors:
+                    old = list(bb.successors)
+                    bb.successors.clear()
+                    for succ in old:
+                        if bb in getattr(succ, 'predecessors', []):
+                            succ.predecessors.remove(bb)
     def run(self):
         self.build_call_graph()
-        # Fixed point iteration
         worklist = set(self.functions.keys())
         iteration = 0
-        while worklist and iteration < 20:  # Limit iterations just in case
+        while worklist and iteration < 30: # safe bound
             iteration += 1
             next_worklist = set()
-            for f_id, func in self.functions.items():
+            for f_id in list(worklist):
+                func = self.functions[f_id]
                 changed = False
-                callers = self.reverse_call_graph.get(func.entry_label, [])
-                if not callers and func.entry_label not in self.reverse_call_graph:
-                    callers = self.reverse_call_graph.get(f_id, [])
+                callers = self.reverse_call_graph.get(func.entry_label, []) or self.reverse_call_graph.get(f_id, [])
                 ext_sig = ExternalABIDB.get(func.entry_label)
-                # --- Merge Arguments Constraints ---
-                current_args = self.func_constraints[f_id]['args']
-                new_args = list(current_args)
+                # Arg constraints (caller → callee)
+                new_args = list(self.func_constraints[f_id]['args'])
                 for cs in callers:
                     for i in range(6):
-                        passed_t = self._find_type_passed_at_call(cs, i)
-                        new_args[i] = meet(new_args[i], passed_t)
-                if ext_sig:
-                    for i, arg_t in enumerate(ext_sig['args']):
+                        passed = self._find_type_passed_at_call(cs, i)
+                        new_args[i] = meet(new_args[i], passed)
+                if ext_sig and 'args' in ext_sig:
+                    for i, at in enumerate(ext_sig['args']):
                         if i < len(new_args):
-                            new_args[i] = meet(new_args[i], arg_t)
-                if new_args != current_args:
+                            new_args[i] = meet(new_args[i], at)
+                if new_args != self.func_constraints[f_id]['args']:
                     self.func_constraints[f_id]['args'] = new_args
                     changed = True
-                # --- Merge Return Constraints ---
-                current_ret = self.func_constraints[f_id]['ret']
-                new_ret = current_ret
+                # Return constraints (callee → caller + external)
+                new_ret = self.func_constraints[f_id]['ret']
                 for cs in callers:
-                    usage_t = self._find_return_usage_at_call(cs)
-                    new_ret = meet(new_ret, usage_t)
+                    usage = self._find_return_usage_at_call(cs)
+                    new_ret = meet(new_ret, usage)
                 if ext_sig:
                     if ext_sig.get('noreturn'):
                         new_ret = TypeRef.unknown()
-                    elif ext_sig['ret']:
+                    elif ext_sig.get('ret'):
                         new_ret = meet(new_ret, ext_sig['ret'])
-                step8_ret = TypeRef.from_string(func.return_type)
-                new_ret = meet(new_ret, step8_ret)
-                if new_ret != current_ret:
+                new_ret = meet(new_ret, TypeRef.from_string(func.return_type))
+                if new_ret != self.func_constraints[f_id]['ret']:
                     self.func_constraints[f_id]['ret'] = new_ret
                     changed = True
                 if changed:
+                    next_worklist.add(f_id)
                     for cs in callers:
                         next_worklist.add(cs.caller.id)
+                    # Re-queue callees for arg flow
+                    for cs_out in self.call_graph:
+                        if cs_out.caller.id == f_id and cs_out.target_name in self.functions:
+                            next_worklist.add(cs_out.target_name)
             worklist = next_worklist
+        self._prune_noreturn_fallthrough()
         self._finalize_signatures()
-
+        self._propagate_refinements() # global op_refinement / arg / return consistency
+    def _refine_external_abi_signature(self, func: Function, refined_ret: str) -> str:
+        """Merge interprocedural results into Step 7 external sig while preserving structure."""
+        existing = func.external_abi_signature
+        if not existing or '(' not in existing:
+            return f"{refined_ret} ()"
+        _, rest = existing.split(' (', 1)
+        return f"{refined_ret} ({rest}"
+    def _propagate_refinements(self):
+        """Minimal practical propagation to AST (args, return_type, op_refinement seeds)."""
+        for f_id, cons in self.func_constraints.items():
+            func = self.functions.get(f_id)
+            if not func:
+                continue
+            for i, at in enumerate(cons['args']):
+                if i < len(func.arguments) and not at.is_unknown():
+                    func.arguments[i].inferred_type = at.to_string()
+            rt = cons['ret']
+            if not rt.is_unknown() and func.return_type != 'void':
+                func.return_type = rt.to_string()
     def _finalize_signatures(self):
+        """Finalize dual signatures.
+        - lifted_signature: internal LLVM view (void + noreturn attribute when applicable).
+        - external_abi_signature: boundary functions only – preserves the exact C ABI contract
+          expected by the runtime/linker (return type is NEVER forced to void by noreturn).
+        """
         for f_id, func in self.functions.items():
-            constraints = self.func_constraints[f_id]
-            # Determine Return Type String
-            ret_type_str = 'void'
-            is_noreturn = func.noreturn_kind == 'noreturn'
+            cons = self.func_constraints[f_id]
             ext_sig = ExternalABIDB.get(func.entry_label)
-            if ext_sig and ext_sig.get('noreturn'):
-                is_noreturn = True
-            ret_t = constraints['ret']
-            if is_noreturn:
-                ret_type_str = 'void'
-            elif not ret_t.is_unknown():
-                ret_type_str = ret_t.to_string()
-            else:
-                # Fallback to Step 7 or i64
-                if func.return_type:
-                    ret_type_str = func.return_type
-                else:
-                    ret_type_str = 'i64'
-            # Adjust naming for LLVM
-            if ret_type_str.endswith('_signed') or ret_type_str.endswith('_unsigned'):
-                ret_type_str = ret_type_str.rsplit('_', 1)[0]
-            if ret_type_str == 'ptr':
-                ret_type_str = 'i8*'
-            if ret_type_str == 'f32': ret_type_str = 'float'
-            if ret_type_str == 'f64': ret_type_str = 'double'
-            attributes = []
-            if is_noreturn:
-                attributes.append('noreturn')
-            func.lifted_signature = LiftedFunctionSignature(
-                return_type=ret_type_str,
-                attributes=attributes
-            )
+            is_noreturn = (func.noreturn_kind == 'noreturn' or
+                           (ext_sig and ext_sig.get('noreturn')))
 
+            ret_t = cons['ret']
+            # Base return type from interprocedural refinement + original Step-7 ABI seed
+            base_ret = (ret_t.to_string() if not ret_t.is_unknown()
+                        else (func.return_type or 'i64'))
+            if base_ret.endswith(('_signed', '_unsigned')):
+                base_ret = base_ret.rsplit('_', 1)[0]
+            if base_ret == 'ptr':
+                base_ret = 'i8*'
+
+            # Lifted (internal) signature – noreturn becomes void + attribute
+            lifted_ret_type_str = 'void' if is_noreturn else base_ret
+            attributes = ['noreturn'] if is_noreturn else []
+            func.lifted_signature = LiftedFunctionSignature(
+                return_type=lifted_ret_type_str, attributes=attributes)
+
+            # External ABI signature (boundary only)
+            # MUST keep the original ABI return type (e.g. i32 for main)
+            if func.is_boundary:
+                if func.external_abi_signature and '(' in func.external_abi_signature:
+                    # Step-7 ABI recovery is authoritative for the external contract
+                    abi_ret_type_str = func.external_abi_signature.split(' (', 1)[0]
+                else:
+                    abi_ret_type_str = base_ret
+                func.external_abi_signature = self._refine_external_abi_signature(
+                    func, abi_ret_type_str)
 def main():
     try:
         raw = sys.stdin.read()
@@ -396,8 +353,8 @@ def main():
             sys.stderr.write("No input on stdin.\n")
             sys.exit(2)
         obj = json.loads(raw)
-    except json.JSONDecodeError as e:
-        sys.stderr.write(f"JSON Parse Error: {e}\n")
+    except Exception as e:
+        sys.stderr.write(f"JSON error: {e}\n")
         sys.exit(3)
     try:
         program = legacy_program_dict_to_ast(obj, include_enhancements=True)
@@ -407,10 +364,9 @@ def main():
         json.dump(legacy_out, sys.stdout, indent=2)
         sys.stdout.write("\n")
     except Exception as e:
-        sys.stderr.write(f"Error in Step 9: {repr(e)}\n")
+        sys.stderr.write(f"Step 9 error: {repr(e)}\n")
         import traceback
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
-
 if __name__ == "__main__":
     main()

@@ -139,6 +139,9 @@ class Function(ASTNode):
     entry_label: Optional[str] = None
     """Name of the entry label (e.g., 'main', 'print_help'). Stored as string."""
 
+    is_boundary: bool = False
+    """True if the function is a boundary entry point (global, main, _start, or referenced in init/fini arrays)."""
+
     location: Optional[Dict[str, Any]] = None
     """Optional location metadata for the function."""
 
@@ -165,7 +168,10 @@ class Function(ASTNode):
     """One of: 'standard', 'partial', 'custom', 'raw'."""
 
     lifted_signature: Optional[LiftedFunctionSignature] = None
-    """Set in Step 9: finalized return type and LLVM attributes after interprocedural refinement."""
+    """Finalized return type and LLVM attributes after interprocedural refinement"""
+
+    external_abi_signature: Optional[str] = None
+    """External ABI-compliant signature string for boundary functions"""
 
 
 @dataclass
@@ -515,6 +521,8 @@ def _serialize_function(func: Function, include_instr_locations: bool = False, i
     res['basic_blocks'] = [_serialize_basic_block(bb, include_instr_locations=include_instr_locations, include_enhancements=include_enhancements) for bb in func.basic_blocks]
     if func.entry_label:
         res['entry_label'] = func.entry_label
+    if func.is_boundary:
+        res['is_boundary'] = True
     if func.location:
         res['location'] = func.location
     if include_enhancements:
@@ -539,6 +547,8 @@ def _serialize_function(func: Function, include_instr_locations: bool = False, i
                 'return_type': func.lifted_signature.return_type,
                 'attributes': func.lifted_signature.attributes
             }
+        if func.external_abi_signature is not None:
+            res['external_abi_signature'] = func.external_abi_signature
     return res
 
 
@@ -630,7 +640,7 @@ def _deserialize_stack_slot(ss_dict: Dict[str, Any]) -> StackSlot:
         kind=ss_dict['kind'],
         register=ss_dict.get('register'),
         index=ss_dict.get('index', 0),
-        refinement=ss_dict.get('refinement') if 'refinement' in ss_dict else None,
+        inferred_type=ss_dict.get('inferred_type'),
     )
 
 
@@ -765,6 +775,7 @@ def _deserialize_function(func_dict: Dict[str, Any], include_enhancements: bool 
     func = Function(basic_blocks=basic_blocks)
     if 'entry_label' in func_dict:
         func.entry_label = func_dict['entry_label']
+    func.is_boundary = func_dict.get('is_boundary', False)
     if 'location' in func_dict:
         func.location = func_dict['location']
     if include_enhancements:
@@ -788,6 +799,7 @@ def _deserialize_function(func_dict: Dict[str, Any], include_enhancements: bool 
                 return_type=ls_dict['return_type'],
                 attributes=ls_dict.get('attributes', [])
             )
+        func.external_abi_signature = func_dict.get('external_abi_signature')
     return func
 
 
