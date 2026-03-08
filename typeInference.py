@@ -20,7 +20,7 @@ Outputs: Further enriched AST with type refinement annotations + resolved indire
 import sys
 import json
 from collections import defaultdict
-from typing import Dict, Set
+from typing import Dict, Set, List, Any, Optional
 from astNodes import (
     legacy_program_dict_to_ast,
     ast_to_legacy_program_dict,
@@ -114,52 +114,124 @@ class Step8Refinement:
 
         label_to_bb = self.get_label_to_bb(func)
 
-        basic_state = defaultdict(lambda: "unknown")
-        block_state: Dict[str, Set[str]] = defaultdict(set)
+        # Per-BB State Maps: bb_id -> { reg: type } / { reg: set(labels) }
+        bb_in_type: Dict[str, Dict[str, str]] = {}
+        bb_out_type: Dict[str, Dict[str, str]] = {}
+        bb_in_block: Dict[str, Dict[str, Set[str]]] = {}
+        bb_out_block: Dict[str, Dict[str, Set[str]]] = {}
 
-        self.seed_initial_state(basic_state, func, sub_to_full)
+        # Initialize states
+        seeds = self.seed_initial_state(func, sub_to_full)
 
-        # Fixed-point iteration (basic + block provenance)
-        for _ in range(20):
-            new_basic = basic_state.copy()
-            new_block: Dict[str, Set[str]] = {k: set(v) for k, v in block_state.items()}
+        for bb in func.basic_blocks:
+            bid = bb.id if bb.id else f"bb_{id(bb)}"
+            # Entry BB gets seeds, others start unknown/empty
+            if not bb.predecessors:
+                bb_in_type[bid] = seeds.copy()
+                bb_in_block[bid] = defaultdict(set)
+            else:
+                bb_in_type[bid] = defaultdict(lambda: "unknown")
+                bb_in_block[bid] = defaultdict(set)
+
+            # Initialize out as copy of in (will be overwritten in loop)
+            bb_out_type[bid] = bb_in_type[bid].copy()
+            bb_out_block[bid] = {k: set(v) for k, v in bb_in_block[bid].items()}
+
+        # Fixed-point iteration
+        for _ in range(50): # Increased limit for safety
             changed = False
             for bb in func.basic_blocks:
+                bid = bb.id if bb.id else f"bb_{id(bb)}"
+
+                # Compute In-State from Predecessors' Out-States
+                if bb.predecessors:
+                    new_in_type: Dict[str, str] = defaultdict(lambda: "unknown")
+                    new_in_block: Dict[str, Set[str]] = defaultdict(set)
+
+                    for pred in bb.predecessors:
+                        pid = pred.id if pred.id else f"bb_{id(pred)}"
+                        pred_out_t = bb_out_type.get(pid, {})
+                        pred_out_b = bb_out_block.get(pid, {})
+
+                        # LUB Types
+                        for reg, t in pred_out_t.items():
+                            new_in_type[reg] = lub(new_in_type.get(reg, "unknown"), t)
+
+                        # Union Block Addresses
+                        for reg, labels in pred_out_b.items():
+                            new_in_block[reg] |= labels
+
+                    # Check for changes in In-State
+                    # Note: We compare new_in with stored bb_in_type
+                    # For types
+                    for k in set(new_in_type.keys()) | set(bb_in_type[bid].keys()):
+                        if new_in_type.get(k, "unknown") != bb_in_type[bid].get(k, "unknown"):
+                            changed = True
+                            bb_in_type[bid][k] = new_in_type.get(k, "unknown")
+                    # For blocks
+                    for k in set(new_in_block.keys()) | set(bb_in_block[bid].keys()):
+                        if new_in_block.get(k, set()) != bb_in_block[bid].get(k, set()):
+                            changed = True
+                            bb_in_block[bid][k] = set(new_in_block.get(k, set()))
+                else:
+                    # Entry block: ensure seeds are present
+                    for k, v in seeds.items():
+                        if bb_in_type[bid].get(k, "unknown") != v:
+                            bb_in_type[bid][k] = v
+                            changed = True
+
+                # Compute Out-State by processing instructions
+                # Start with a copy of In-State
+                current_type = bb_in_type[bid].copy()
+                current_block = {k: set(v) for k, v in bb_in_block[bid].items()}
+
                 for instr in bb.instructions:
-                    self.transfer(instr, basic_state, new_basic, block_state, new_block, sub_to_full, func, annotate=False)
-            if new_basic == basic_state and all(sorted(new_block.get(k, [])) == sorted(block_state.get(k, [])) for k in set(new_block) | set(block_state)):
+                    self.transfer(instr, current_type, current_block, sub_to_full, func, annotate=False)
+
+                # Update stored Out-State
+                # Check for changes
+                if current_type != bb_out_type[bid]:
+                    changed = True
+                    bb_out_type[bid] = current_type
+                if current_block != bb_out_block[bid]:
+                    changed = True
+                    bb_out_block[bid] = current_block
+
+            if not changed:
                 break
-            basic_state = new_basic
-            block_state = new_block
 
-        # Post-convergence: resolve indirect targets, update CFG, finalize noreturn (Revised Step 8)
-        self.resolve_indirects(func, block_state, label_to_bb)
+        # Post-convergence: resolve indirect targets, update CFG, finalize noreturn
+        self.resolve_indirects(func, bb_out_block, label_to_bb)
 
-        # Final annotation pass (basic refinements only - block provenance not annotated)
-        basic_state = defaultdict(lambda: "unknown")
-        self.seed_initial_state(basic_state, func, sub_to_full)
+        # Final annotation pass using converged states
         for bb in func.basic_blocks:
+            bid = bb.id if bb.id else f"bb_{id(bb)}"
+            # Start with In-State for this BB
+            current_type = bb_in_type[bid].copy()
+            current_block = {k: set(v) for k, v in bb_in_block[bid].items()}
             for instr in bb.instructions:
-                self.transfer(instr, basic_state, basic_state, block_state, {}, sub_to_full, func, annotate=True)
+                self.transfer(instr, current_type, current_block, sub_to_full, func, annotate=True)
 
-    def seed_initial_state(self, basic_state: Dict, func: Function, sub_to_full: dict):
-        basic_state["RSP"] = "ptr"
+    def seed_initial_state(self, func: Function, sub_to_full: dict) -> Dict[str, str]:
+        seeds: Dict[str, str] = {}
+        seeds["RSP"] = "ptr"
         if func.uses_frame_pointer:
-            basic_state["RBP"] = "ptr"
+            seeds["RBP"] = "ptr"
         for arg in func.arguments:
             if arg.kind == "register":
                 full = sub_to_full.get(arg.location, arg.location)
                 if "*" in str(arg.inferred_type):
-                    basic_state[full] = "ptr"
+                    seeds[full] = "ptr"
                 elif arg.inferred_type == "i32":
-                    basic_state[full] = "i32_unsigned"
+                    seeds[full] = "i32_unsigned"
                 else:
-                    basic_state[full] = "i64"
+                    seeds[full] = "i64"
         for slot in func.stack_slots:
             key = f"stack_{slot.offset}"
-            basic_state[key] = "i64"
+            seeds[key] = "i64"
+        return seeds
 
-    def transfer(self, instr: Instruction, basic_state: Dict, new_basic: Dict, block_state: Dict, new_block: Dict, sub_to_full: dict, func: Function, annotate: bool = False):
+    def transfer(self, instr: Instruction, type_state: Dict[str, str], block_state: Dict[str, Set[str]], sub_to_full: dict, func: Function, annotate: bool = False):
         opcode = instr.opcode.replace("LOCK ", "")
         is_cvt_to_int = opcode in ("CVTTSS2SI", "CVTTSD2SI", "CVTSS2SI", "CVTSD2SI")
         is_float_op = ("SS" in opcode or "SD" in opcode or opcode in ("MOVSS", "MOVSD")) and not is_cvt_to_int
@@ -193,13 +265,13 @@ class Step8Refinement:
             mem = instr.operands[1].memory
             if mem.base and not mem.index and (mem.scale is None or mem.scale == 1):
                 full_base = sub_to_full.get(mem.base, mem.base)
-                if basic_state.get(full_base) == "ptr":
+                if type_state.get(full_base) == "ptr":
                     op_ref = "ptr"
         if opcode in ("MOV", "XCHG", "CMOVE") and len(instr.operands) == 2:
             src = instr.operands[1]
             if src.register:
                 src_full = sub_to_full.get(src.register, src.register)
-                if basic_state.get(src_full) == "ptr":
+                if type_state.get(src_full) == "ptr":
                     op_ref = "ptr"
         if opcode == "LEA" and len(instr.operands) == 2:
             src = instr.operands[1]
@@ -211,11 +283,11 @@ class Step8Refinement:
                     is_arith = False
                 if mem.base:
                     full = sub_to_full.get(mem.base, mem.base)
-                    if basic_state.get(full) == "ptr":
+                    if type_state.get(full) == "ptr":
                         is_arith = False
                 if mem.index:
                     full = sub_to_full.get(mem.index, mem.index)
-                    if basic_state.get(full) == "ptr":
+                    if type_state.get(full) == "ptr":
                         is_arith = False
                 if is_arith:
                     op_ref = f"i{op_width}"
@@ -231,7 +303,7 @@ class Step8Refinement:
                     dest = instr.operands[0]
                     if dest.register:
                         full = sub_to_full.get(dest.register, dest.register)
-                        if basic_state.get(full, "unknown") == "ptr":
+                        if type_state.get(full, "unknown") == "ptr":
                             op_ref = "ptr"
             elif opcode in ("ADD", "SUB") and len(instr.operands) == 2:
                 src = instr.operands[1]
@@ -239,7 +311,7 @@ class Step8Refinement:
                     dest = instr.operands[0]
                     if dest.register:
                         full = sub_to_full.get(dest.register, dest.register)
-                        if basic_state.get(full, "unknown") == "ptr":
+                        if type_state.get(full, "unknown") == "ptr":
                             op_ref = "ptr"
         if annotate:
             if op_ref is not None:
@@ -247,68 +319,81 @@ class Step8Refinement:
             for op in instr.operands:
                 if op.register:
                     full = sub_to_full.get(op.register, op.register)
-                    op.inferred_type = basic_state.get(full, "unknown")
+                    op.inferred_type = type_state.get(full, "unknown")
                 if op.memory:
                     op.address_refinement = "ptr"
                     op.inferred_type = f"i{op_width}" if not is_float_op else (op_ref if op_ref else "unknown")
                 elif op.name or getattr(op, "symbol_ref", None) or getattr(op, "expression", None):
                     op.inferred_type = "ptr"
-        result_ref = op_ref if op_ref is not None else "unknown"
+
+        # Update State (Definition vs Refinement)
+        # For definitions (MOV, LEA, etc.), we assign. For others, we could LUB,
+        # but since we walk sequentially, assignment of the computed result_ref is usually correct
+        # provided result_ref is not 'unknown'.
         if instr.operands:
             dest = instr.operands[0]
             if dest.register:
                 full = sub_to_full.get(dest.register, dest.register)
+                result_ref = op_ref if op_ref is not None else "unknown"
                 if is_zeroing_write(dest.register):
                     result_ref = "i64_unsigned"
-                new_basic[full] = lub(new_basic.get(full, "unknown"), result_ref)
+
+                if result_ref != "unknown":
+                    type_state[full] = result_ref
+
+                # Special handling for MOV source type propagation
                 if opcode == "MOV" and len(instr.operands) == 2 and instr.operands[1].register:
                     src_full = sub_to_full.get(instr.operands[1].register, instr.operands[1].register)
-                    src_type = basic_state.get(src_full, "unknown")
-                    new_basic[full] = lub(new_basic.get(full, "unknown"), src_type)
-            if opcode == "MOVSX":
-                result_ref = "i64_signed"
-                if dest.register:
-                    full = sub_to_full.get(dest.register, dest.register)
-                    new_basic[full] = lub(new_basic.get(full, "unknown"), result_ref)
-            elif opcode == "MOVZX":
-                result_ref = "i64_unsigned"
-                if dest.register:
-                    full = sub_to_full.get(dest.register, dest.register)
-                    new_basic[full] = lub(new_basic.get(full, "unknown"), result_ref)
-            elif opcode == "CDQ":
-                if basic_state.get("RAX", "").endswith("signed"):
-                    new_basic["RDX"] = "i32_signed"
-            elif opcode == "CQO":
-                if basic_state.get("RAX", "").endswith("signed"):
-                    new_basic["RDX"] = "i64_signed"
+                    src_type = type_state.get(src_full, "unknown")
+                    if src_type != "unknown":
+                        # MOV propagates source type if dest ref is generic
+                        if result_ref == "unknown" or result_ref.startswith("i64"):
+                             # Keep specific source type if dest is wide
+                             type_state[full] = src_type
+
+                if opcode == "MOVSX":
+                    type_state[full] = "i64_signed"
+                elif opcode == "MOVZX":
+                    type_state[full] = "i64_unsigned"
+                elif opcode == "CDQ":
+                    if type_state.get("RAX", "").endswith("signed"):
+                        type_state["RDX"] = "i32_signed"
+                elif opcode == "CQO":
+                    if type_state.get("RAX", "").endswith("signed"):
+                        type_state["RDX"] = "i64_signed"
+
         if is_float_op:
             for op in instr.operands:
                 if op.register and op.register.startswith("XMM"):
-                    new_basic[op.register] = op_ref
+                    type_state[op.register] = op_ref
+
+        # Stack Slots
         for slot in func.stack_slots:
             key = f"stack_{slot.offset}"
             for op in instr.operands:
                 if op.memory and isinstance(op.memory.displacement, int) and op.memory.displacement == slot.offset:
                     if len(instr.operands) > 1 and instr.operands[1].register:
                         full = sub_to_full.get(instr.operands[1].register, instr.operands[1].register)
-                        r = basic_state.get(full, "unknown")
-                        new_basic[key] = lub(new_basic.get(key, "unknown"), r)
+                        r = type_state.get(full, "unknown")
+                        if r != "unknown":
+                            type_state[key] = r # Store refines slot
                         if annotate:
                             op.inferred_type = r
                     else:
-                        r = basic_state.get(key, "unknown")
+                        r = type_state.get(key, "unknown")
                         if annotate:
                             op.inferred_type = r
-                        if instr.operands[0].register:
+                        if instr.operands and instr.operands[0].register:
                             full = sub_to_full.get(instr.operands[0].register, instr.operands[0].register)
-                            new_basic[full] = lub(new_basic.get(full, "unknown"), r)
+                            if r != "unknown":
+                                type_state[full] = r # Load refines reg
 
-        # NEW: Block-address transfer (Revised Step 8 - minimal, targeted)
+        # Block-address transfer
         if instr.operands and instr.operands[0].register:
             dest = instr.operands[0]
             full_dest = sub_to_full.get(dest.register, dest.register)
-            if full_dest not in new_block:
-                new_block[full_dest] = set()
+            if full_dest not in block_state:
+                block_state[full_dest] = set()
             if opcode == "LEA" and len(instr.operands) == 2:
                 src = instr.operands[1]
                 symbol_ref = getattr(src, "symbol_ref", None)
@@ -317,22 +402,22 @@ class Step8Refinement:
                     if isinstance(label_name, str) and label_name in self.program.symbol_table:
                         info = self.program.symbol_table[label_name]
                         if info.get("kind") == "label" and info.get("definition", {}).get("bb_id"):
-                            new_block[full_dest] = {label_name}
+                            block_state[full_dest] = {label_name}
             elif opcode in ("MOV", "CMOVE") and len(instr.operands) == 2 and instr.operands[1].register:
                 src = instr.operands[1]
                 full_src = sub_to_full.get(src.register, src.register)
                 src_blocks = block_state.get(full_src, set())
                 if opcode == "CMOVE":
-                    new_block[full_dest] |= src_blocks
+                    block_state[full_dest] |= src_blocks
                 else:
-                    new_block[full_dest] = src_blocks.copy()
+                    block_state[full_dest] = src_blocks.copy()
             elif opcode in ("ADD", "SUB", "XOR", "AND", "OR", "IMUL", "SHL", "SAR", "INC", "DEC"):
-                new_block[full_dest] = set()
+                block_state[full_dest] = set()
             elif opcode in ("MOV", "MOVZX", "MOVSX") and len(instr.operands) == 2 and instr.operands[1].memory:
-                new_block[full_dest] = set()  # memory load clears provenance (unless jump-table, omitted for practicality)
+                block_state[full_dest] = set()
 
-    def resolve_indirects(self, func: Function, block_state: Dict[str, Set[str]], label_to_bb: Dict[str, BasicBlock]):
-        """Post-convergence indirect target resolution + CFG finalization (Revised Step 8)."""
+    def resolve_indirects(self, func: Function, bb_out_block: Dict[str, Dict[str, Set[str]]], label_to_bb: Dict[str, BasicBlock]):
+        """Post-convergence indirect target resolution + CFG finalization."""
         for bb in func.basic_blocks:
             if not bb.instructions:
                 continue
@@ -342,10 +427,11 @@ class Step8Refinement:
             if not term.operands or not term.operands[0].register:
                 continue
             reg = term.operands[0].register
-            full = reg # R8 stays R8, etc.
-            targets_set = block_state.get(full, set())
+            bid = bb.id if bb.id else f"bb_{id(bb)}"
+            # Use the converged OUT state of this specific BB
+            targets_set = bb_out_block.get(bid, {}).get(reg, set())
             resolved = [label_to_bb[lbl] for lbl in targets_set if lbl in label_to_bb]
-            # Safe CFG update – NO set() on BasicBlock objects
+
             if bb.successors is None:
                 bb.successors = []
             for tbb in resolved:
@@ -370,8 +456,7 @@ class Step8Refinement:
                     if bb not in tbb.predecessors:
                         tbb.predecessors.append(bb)
 
-        # Prune fall-through after calls to noreturn functions (internal or exit)
-        # This eliminates the spurious edges
+        # Prune fall-through after calls to noreturn functions
         for bb in func.basic_blocks:
             if not bb.instructions:
                 continue
@@ -383,7 +468,6 @@ class Step8Refinement:
             if not callee_name:
                 continue
 
-            # Is the callee a noreturn function?
             is_noreturn_callee = (callee_name == "exit")
             if not is_noreturn_callee:
                 for section in self.program.sections:
@@ -396,14 +480,13 @@ class Step8Refinement:
                         break
 
             if is_noreturn_callee:
-                # Remove fall-through successor(s) and keep bidirectional consistency
                 if bb.successors:
                     for succ in list(bb.successors):
                         if getattr(succ, 'predecessors', None) and bb in succ.predecessors:
                             succ.predecessors.remove(bb)
                     bb.successors.clear()
 
-        # Noreturn finalization for pending_resolution (unchanged)
+        # Noreturn finalization
         if getattr(func, 'noreturn_kind', None) == "pending_resolution":
             has_exit = any(
                 i.opcode == "CALL" and i.operands and getattr(i.operands[0], 'name', None) == "exit"
