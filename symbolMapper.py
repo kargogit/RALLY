@@ -314,8 +314,9 @@ class SymbolMapper:
                     entry['visibility'] = 'global'
                 
                 if 'integer' in equ:
-                    val = int(equ['integer']['value'])
-                    entry['value'] = val
+                    val = equ['integer']['value']
+                    # Using base=0 smartly parses prefixes like 0x automatically
+                    entry['value'] = int(val, 0) if isinstance(val, str) else int(val)
                     entry['llvm_type'] = 'i64'
                 elif 'expression' in equ:
                     expr = equ['expression']
@@ -340,7 +341,8 @@ class SymbolMapper:
                 count = 1
                 int_obj = pseudo.get('integer')
                 if int_obj and isinstance(int_obj, dict):
-                    count = int(int_obj.get('value', 1))
+                    val = int_obj.get('value', 1)
+                    count = int(val, 0) if isinstance(val, str) else int(val)
                 base = resx[3:].lower()
                 llvm_type_str = LLVM_RES_TYPES.get(base, 'i8')
                 entry = self._ensure_symbol_entry(name, 'data')
@@ -355,7 +357,8 @@ class SymbolMapper:
                     entry['visibility'] = 'global'
 
             elif integer_val:
-                val = int(integer_val.get('value', 0))
+                val = integer_val.get('value', 0)
+                val = int(val, 0) if isinstance(val, str) else int(val)
                 entry = self._ensure_symbol_entry(name, 'constant')
                 entry['value'] = str(val)
                 entry['llvm_type'] = 'i64'
@@ -378,7 +381,9 @@ class SymbolMapper:
                     for c in s:
                         flat_values.append(ord(c))
                 elif 'integer' in v:
-                    flat_values.append(int(v['integer']['value']))
+                    val = v['integer']['value']
+                    # Using base=0 smartly parses prefixes like 0x automatically
+                    flat_values.append(int(val, 0) if isinstance(val, str) else int(val))
                 elif 'float' in v:
                     is_float = True
                     type_hint = LLVM_FLOAT_TYPES[kind.lower()]
