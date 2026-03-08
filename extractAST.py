@@ -8,7 +8,7 @@ Public interface:
     (returns the legacy dict format via astNodes.ast_to_legacy_program_dict)
 """
 
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Set
 from abc import ABC
 import json
 import sys
@@ -200,7 +200,6 @@ class RipRelativeDetector:
         return None
 
 
-
 # ---------------------------------------------------------------------------
 # Transformation registry for small reusable handlers
 # ---------------------------------------------------------------------------
@@ -242,13 +241,23 @@ class ExpressionVisitor:
             return self._visit_additive(actual_expr['additiveExpression'])
         if 'multiplicativeExpression' in actual_expr:
             return self._visit_multiplicative(actual_expr['multiplicativeExpression'])
+        if 'wrt' in actual_expr:
+            return self._visit_wrt(actual_expr['wrt'])
 
         # STRICT CHECK: If we are here, the expression contains something we don't know how to handle
-        # e.g., 'wrt', 'seg', 'binaryExpression' with unknown ops
+        # e.g., 'seg', 'binaryExpression' with unknown ops
         keys = list(actual_expr.keys())
         if keys and keys != ['_loc']:
             raise TranslationError(f"Unsupported expression construct(s): {keys}")
 
+        return None
+
+    def _visit_wrt(self, wrt_expr: List[Any]) -> Any:
+        if isinstance(wrt_expr, list) and len(wrt_expr) >= 1:
+            # We just want the base symbol to align with standard operand definitions
+            symbol_part = wrt_expr[0]
+            symbol = self.navigator.normalize_token(symbol_part)
+            return {'name_from_wrt': symbol}
         return None
 
     def _visit_cast(self, cast_expr: List[Any]) -> Any:
@@ -327,6 +336,10 @@ class AsmTransformer(ParseTreeVisitor):
         # default text section present to preserve legacy behavior
         self.text_section = Section(name='.text')
 
+        # --- FIX FOR POINT 4: Equ Registry ---
+        # Stores symbol_name -> concrete_value (int) for equ-defined constants
+        self.equ_registry: Dict[str, int] = {}
+
     def _setup_handlers(self):
         @self.registry.register('integer')
         def handle_integer(data, ctx):
@@ -362,6 +375,13 @@ class AsmTransformer(ParseTreeVisitor):
         def handle_instruction(data, ctx):
             return self.visit_instruction(data, ctx)
 
+    # --- FIX FOR POINT 4: Helper to resolve equ symbols ---
+    def _resolve_equ_symbol(self, symbol_name: str) -> Optional[int]:
+        """
+        If symbol_name is an equ-defined constant, return its concrete value.
+        Otherwise return None.
+        """
+        return self.equ_registry.get(symbol_name)
 
     def _convert_expression_to_memory(self, expr: Any) -> Optional[Memory]:
         """
@@ -423,6 +443,10 @@ class AsmTransformer(ParseTreeVisitor):
 
     # Top-level program builder
     def visit_program(self, program_data: List[Any], context: Dict[str, Any]) -> Program:
+        # --- FIX FOR POINT 4: Two-Pass Approach ---
+        # Pass 1: Collect all equ definitions before building the AST
+        self._collect_equ_definitions(program_data)
+
         prog = Program(sections=[self.text_section])
         context['current_section'] = self.text_section
 
@@ -473,6 +497,97 @@ class AsmTransformer(ParseTreeVisitor):
                     ctx_sec.pseudo_instruct.append(pseudo)
 
         return prog
+
+    # --- FIX FOR POINT 4: Pass 1 - Collect Equ Definitions ---
+    def _collect_equ_definitions(self, program_data: List[Any]):
+        """
+        First pass: traverse parse tree to collect all 'equ' definitions
+        into self.equ_registry before building the AST.
+        """
+        for node in program_data:
+            if not isinstance(node, dict):
+                continue
+            # Recursively search for pseudo-instructions with equ
+            self._scan_for_equ(node)
+
+    def _scan_for_equ(self, node: Any):
+        """Recursively scan a node for equ definitions."""
+        if isinstance(node, dict):
+            if 'pseudoinstruction' in node:
+                pseudo_data = node['pseudoinstruction']
+                if isinstance(pseudo_data, list):
+                    self._extract_equ_from_pseudo(pseudo_data)
+            # Recurse into children
+            for key, value in node.items():
+                if key != '_loc':
+                    self._scan_for_equ(value)
+        elif isinstance(node, list):
+            for item in node:
+                self._scan_for_equ(item)
+
+    def _extract_equ_from_pseudo(self, pseudo_data: List[Any]):
+        """Extract equ name and value from pseudo-instruction data."""
+        name = None
+        value = None
+        for item in pseudo_data:
+            if not isinstance(item, dict):
+                continue
+            if 'name' in item:
+                name = self.navigator.normalize_token(item['name'])
+            elif 'equ' in item:
+                # Next item should contain the value/expression
+                pass  # handled below
+            elif 'expression' in item:
+                # Try to evaluate simple integer expressions
+                val = self._evaluate_equ_expression(item['expression'])
+                if val is not None and name:
+                    self.equ_registry[name] = val
+            elif 'integer' in item:
+                # Direct integer equ (e.g., count equ 3)
+                imm = self.registry.transform('integer', item['integer'])
+                if imm and name:
+                    try:
+                        self.equ_registry[name] = int(imm.value)
+                    except (ValueError, TypeError):
+                        pass  # Keep as-is if not convertible
+
+    def _evaluate_equ_expression(self, expr_container: Any) -> Optional[int]:
+        """
+        Attempt to evaluate a simple equ expression to a concrete integer.
+        Returns None if the expression is too complex or symbolic.
+        """
+        if not expr_container or not isinstance(expr_container, list):
+            return None
+
+        actual = expr_container[0] if expr_container else None
+        if not isinstance(actual, dict):
+            return None
+
+        # Simple integer case
+        if 'integer' in actual:
+            int_data = actual['integer'][0]
+            if isinstance(int_data, (list, tuple)) and int_data:
+                try:
+                    return int(int_data[0], 0)  # handles hex/dec
+                except (ValueError, TypeError):
+                    return None
+
+        # Additive expression (e.g., 1 + 2)
+        if 'additiveExpression' in actual:
+            add_expr = actual['additiveExpression']
+            if isinstance(add_expr, list) and len(add_expr) == 3:
+                # Expect: operand, operator, operand
+                left = self._evaluate_equ_expression([add_expr[0]])
+                op = add_expr[1] if isinstance(add_expr[1], str) else self.navigator.normalize_token(add_expr[1])
+                right = self._evaluate_equ_expression([add_expr[2]])
+
+                if left is not None and right is not None:
+                    if op == '+':
+                        return left + right
+                    elif op == '-':
+                        return left - right
+
+        return None
 
     # generic line visitor that handles directive/pseudoinstruction etc.
     def visit_line(self, line_data: List[Any], context: Dict[str, Any]) -> Optional[Any]:
@@ -578,7 +693,8 @@ class AsmTransformer(ParseTreeVisitor):
                 key = 'opcode' if 'opcode' in piece else 'terminator_opcode'
                 instr.opcode = self.navigator.normalize_token(piece[key]).upper()
             elif 'operand' in piece:
-                op = self.visit_operand(piece['operand'], context)
+                # --- FIX FOR POINT 4: Pass opcode context to operand visitor ---
+                op = self.visit_operand(piece['operand'], context, current_opcode=instr.opcode)
                 if op:
                     instr.operands.append(op)
             elif '_loc' in piece:
@@ -597,7 +713,7 @@ class AsmTransformer(ParseTreeVisitor):
 
         return instr if instr.opcode else None
 
-    def visit_operand(self, operand_data: List[Any], context: Dict[str, Any]) -> Operand:
+    def visit_operand(self, operand_data: List[Any], context: Dict[str, Any], current_opcode: str = '') -> Operand:
         # detect rip-relative first
         rip_memory = self.rip_detector.detect(operand_data)
         if rip_memory:
@@ -622,6 +738,8 @@ class AsmTransformer(ParseTreeVisitor):
                     op.integer = Immediate(value=int_rec['value'],
                                         type=int_rec['type'],
                                         ascii=int_rec.get('ascii'))
+                elif isinstance(expr_res, dict) and 'name_from_wrt' in expr_res and len(expr_res) == 1:
+                    op.name = expr_res['name_from_wrt']
                 else:
                     # Non-trivial expression: keep as expression field
                     op.expression = expr_res
@@ -630,7 +748,21 @@ class AsmTransformer(ParseTreeVisitor):
                 if imm_node:
                     op.integer = imm_node
             elif 'name' in item:
-                op.name = self.navigator.normalize_token(item['name'])
+                symbol_name = self.navigator.normalize_token(item['name'])
+
+                # --- FIX FOR POINT 4: Equ Symbol Folding ---
+                # Check if this symbol is an equ-defined constant
+                equ_value = self._resolve_equ_symbol(symbol_name)
+
+                # Fold to Immediate ONLY if:
+                # 1. It is an equ-defined constant (equ_value is not None)
+                # 2. We are NOT in an address-taking context (LEA)
+                # 3. We are NOT in a memory operand context (op.memory is None)
+                if equ_value is not None and current_opcode != 'LEA' and op.memory is None:
+                    op.integer = Immediate(value=equ_value, type='EQU_CONSTANT', ascii=None)
+                else:
+                    # Keep as symbol name (for labels, memory displacements, LEA targets)
+                    op.name = symbol_name
             elif 'string' in item:
                 string_node = self.registry.transform('string', item['string'])
                 if string_node:
@@ -863,7 +995,10 @@ class AsmTransformer(ParseTreeVisitor):
         if 'string' in atom:
             return {'string': atom['string'][0][0]} if atom['string'] else None
         if 'expression' in atom:
-            return self._process_expression(atom)
+            expr_res = self._process_expression(atom)
+            if isinstance(expr_res, dict) and 'name_from_wrt' in expr_res and len(expr_res) == 1:
+                return {'symbol': expr_res['name_from_wrt']}
+            return expr_res
         # STRICT CHECK: Handle bare symbols/names inside pseudo values (common in dq/dd)
         if 'name' in atom:
              # Just normalize the name and treat as a symbol reference
