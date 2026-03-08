@@ -451,8 +451,6 @@ def _serialize_operand(op: Operand, include_enhancements: bool = False) -> Dict[
         out['rip_relative'] = op.rip_relative
         # expose via_got explicitly (bool)
         out['via_got'] = getattr(op, 'via_got', False)
-        if op.value_refinement is not None:
-            out['value_refinement'] = op.value_refinement  # serialized as 'pointee_refinement' equivalent for memory
         if op.address_refinement is not None:
             out['address_refinement'] = op.address_refinement
     return out
@@ -712,7 +710,6 @@ def _deserialize_operand(op_dict: Dict[str, Any], include_enhancements: bool = F
             op._temp_symbol_ref = op_dict['symbol_ref']
         op.rip_relative = op_dict.get('rip_relative', False)
         op.via_got = op_dict.get('via_got', False)
-        op.value_refinement = op_dict.get('value_refinement')
         op.address_refinement = op_dict.get('address_refinement')
     return op
 
