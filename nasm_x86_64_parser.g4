@@ -567,7 +567,7 @@ instruction
 
 opcode
     : MOV | LEA
-    | PUSH | POP                            // Stack operations
+    | PUSH | POP | LEAVE                    // Stack operations
     | ADD | SUB | INC | DEC                 // Arithmetic
     | MOVSS | ADDSS | MULSS                 // Floating-Point Arithmetic (SSE)
     | CVTTSS2SI                             // Floating-Point to Integer Conversion (SSE)
