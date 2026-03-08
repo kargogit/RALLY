@@ -1,0 +1,210 @@
+syntax = "proto3";
+
+package lifted_ast;
+
+import "google/protobuf/struct.proto";
+
+message Program {
+  repeated Section sections = 1;
+  repeated string globals = 2;
+  map<string, SymbolEntry> symbol_table = 3;
+  IdMaps id_maps = 4;
+  map<string, string> bb_llvm_mapping = 5;
+  map<string, string> instr_llvm_mapping = 6;
+}
+
+message IdMaps {
+  map<string, FunctionRef> functions = 1;
+  map<string, BasicBlockRef> basic_blocks = 2;
+}
+
+message FunctionRef {
+  optional string section = 1;
+  google.protobuf.Value entry_label = 2;
+}
+
+message BasicBlockRef {
+  optional string function_id = 1;
+  google.protobuf.Value start_label = 2;
+}
+
+message Section {
+  optional string name = 1;
+  repeated SectionChild children = 2;
+  repeated google.protobuf.Struct pseudo_instruct = 3;
+  google.protobuf.Value location = 4;
+}
+
+message SectionChild {
+  oneof kind {
+    Function function = 1;
+    LabelGroup lgroup = 2;
+    DataGroup dgroup = 3;
+  }
+}
+
+message Function {
+  repeated BasicBlock basic_blocks = 1;
+  optional string entry_label = 2;
+  optional bool is_boundary = 3;
+  google.protobuf.Value location = 4;
+  optional string id = 5;
+  optional string noreturn_kind = 6;
+  repeated ArgumentDescriptor arguments = 7;
+  repeated StackSlot stack_slots = 8;
+  optional string return_type = 9;
+  optional bool uses_frame_pointer = 10;
+  optional string abi_compliance = 11;
+  LiftedFunctionSignature lifted_signature = 12;
+  optional string external_abi_signature = 13;
+  optional string parent = 14;
+}
+
+message BasicBlock {
+  repeated InstructionEntry instructions = 1;
+  optional string id = 2;
+  optional string start_label = 3;
+  google.protobuf.Value location = 4;
+  optional string terminator = 5;
+  repeated string successors = 6;
+  repeated string predecessors = 7;
+  optional string parent = 8;
+}
+
+message InstructionEntry {
+  Instruction instruction = 1;
+  google.protobuf.Value location = 2;
+}
+
+message Instruction {
+  optional string opcode = 1;
+  repeated Operand operands = 2;
+  optional string prefix = 3;
+  google.protobuf.Value location = 4;
+  optional string id = 5;
+  repeated string target_blocks = 6;
+  repeated string indirect_targets = 7;
+  optional string indirect_jump_kind = 8;
+  optional string op_refinement = 9;
+  optional string call_target_kind = 10;
+  optional bool indirect_targets_over_approximated = 11;
+  optional string parent = 12;
+}
+
+message Operand {
+  optional string register = 1;
+  Memory memory = 2;
+  Immediate integer = 3;
+  google.protobuf.Value expression = 4;
+  optional string size = 5;
+  optional string name = 6;
+  optional string symbol_ref = 7;
+  optional bool rip_relative = 8;
+  optional bool via_got = 9;
+  optional string inferred_type = 10;
+  optional string address_refinement = 11;
+}
+
+message Memory {
+  optional string base = 1;
+  optional string index = 2;
+  optional int32 scale = 3;
+  google.protobuf.Value displacement = 4;
+}
+
+message Immediate {
+  google.protobuf.Value value = 1;
+  optional string type = 2;
+  optional string ascii = 3;
+}
+
+message LabelGroup {
+  repeated LabelOrInstr items = 1;
+}
+
+message LabelOrInstr {
+  oneof kind {
+    string label = 1;
+    Instruction instruction = 2;
+  }
+  google.protobuf.Value location = 3;
+  optional string id = 4;
+}
+
+message DataGroup {
+  repeated LabelOrDataItem items = 1;
+}
+
+message LabelOrDataItem {
+  oneof kind {
+    string label = 1;
+    DataDirective data_directive = 2;
+  }
+  google.protobuf.Value location = 3;
+  optional string id = 4;
+}
+
+message DataDirective {
+  optional string kind = 1;
+  repeated DataOperand operands = 2;
+  Immediate repeat = 3;
+  optional int32 alignment = 4;
+}
+
+message DataOperand {
+  oneof operand {
+    Immediate immediate = 1;
+    string string = 2;
+    google.protobuf.Value expression = 3;
+  }
+}
+
+message ArgumentDescriptor {
+  optional string kind = 1;
+  google.protobuf.Value location = 2;
+  optional int32 index = 3;
+  optional string inferred_type = 4;
+  google.protobuf.Value first_use = 5;
+}
+
+message StackSlot {
+  optional string name = 1;
+  optional int64 offset = 2;
+  optional int32 size = 3;
+  optional int32 alignment = 4;
+  optional string kind = 5;
+  optional string register = 6;
+  optional int32 index = 7;
+  optional string inferred_type = 8;
+}
+
+message LiftedFunctionSignature {
+  optional string return_type = 1;
+  repeated string attributes = 2;
+}
+
+message SymbolEntry {
+  optional string kind = 1;
+  optional string visibility = 2;
+  google.protobuf.Value definition = 3;
+  optional string llvm_type = 4;
+  optional string section = 5;
+  optional string linkage = 6;
+  optional bool is_definition = 7;
+  optional bool is_boundary = 8;
+  optional string wrapper_ref = 9;
+  optional string lifted_ref = 10;
+  google.protobuf.Value value = 11;
+  optional bool is_external = 12;
+  repeated Relocation relocations = 13;
+  google.protobuf.Value raw = 14;
+  optional string scoped_to = 15;
+  optional bool accessed_via_got = 16;
+  optional string name = 17;
+}
+
+message Relocation {
+  optional string type = 1;
+  optional string instruction = 2;
+  optional bool pic = 3;
+}
