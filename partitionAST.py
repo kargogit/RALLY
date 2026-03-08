@@ -1,4 +1,3 @@
-# partitionAST.py
 """
 Step 3: Partition typed AST (from astNodes.py) into Functions & BasicBlocks.
 
@@ -11,6 +10,7 @@ import itertools
 import uuid
 import dataclasses
 import re
+import copy
 
 # Import dataclasses/types from astNodes.py (must be in same PYTHONPATH)
 from astNodes import (
@@ -106,31 +106,6 @@ def _extract_label_names_from_obj(obj, found: Set[str]) -> None:
         pass
 
 
-def _collect_label_references_from_sections(sections: Iterable[Section]) -> Set[str]:
-    """
-    Scan all sections' children for embedded label references (e.g. `dq constructor_stub`)
-    and return a set of referenced label names.
-    """
-    found: Set[str] = set()
-    for sec in sections:
-        # Section has children which may be LabelGroup, Label, Instruction, or other nodes.
-        for child in getattr(sec, 'children', []) or []:
-            # If child is a LabelGroup, inspect its .instructions field (or equivalent)
-            if isinstance(child, LabelGroup):
-                for it in getattr(child, 'instructions', []) or []:
-                    _extract_label_names_from_obj(it, found)
-            else:
-                # For any other child node (could be a 'function-node' etc), inspect generically
-                _extract_label_names_from_obj(child, found)
-        # Also scan pseudo_instruct for data directives (e.g. in .init_array)
-        for item in getattr(sec, 'pseudo_instruct', []) or []:
-            _extract_label_names_from_obj(item, found)
-    return found
-
-
-
-
-
 def _is_executable_section(section: Section) -> bool:
     return section.name in DEFAULT_EXECUTABLE_SECTIONS
 
@@ -195,73 +170,52 @@ def _collect_operand_label_names(instr: Instruction) -> Set[str]:
     return names
 
 
-import copy
-import dataclasses
-
 def _merge_source_locations(start_loc: Any, end_loc: Any) -> Any:
     """
     Create a new SourceLocation that spans from the start of `start_loc` to the
-    end of `end_loc`. This implementation is robust to:
-      - dict-style locations: { "start": {...}, "end": {...} }
-      - dataclass-style locations (with 'start'/'end' or top-level end fields)
-      - mixed combinations (dict vs dataclass)
-    It prefers to return the same *type* as `start_loc` when possible and never
-    mutates its inputs.
+    end of `end_loc`. This implementation is robust to dicts and dataclasses.
     """
     if not start_loc:
         return copy.deepcopy(end_loc)
     if not end_loc:
         return copy.deepcopy(start_loc)
 
-    # Helper: try to extract a point (line/column-like) from an object
     def _point_from(obj):
         if obj is None:
             return None
         if isinstance(obj, dict):
-            # either { "line":..., "column":... } or nested { "start":..., "end":... }
             if 'line' in obj or 'column' in obj:
                 return {'line': obj.get('line'), 'column': obj.get('column')}
             if 'start' in obj and isinstance(obj['start'], dict):
                 return {'line': obj['start'].get('line'), 'column': obj['start'].get('column')}
-            # fallback: return the dict itself
             return copy.deepcopy(obj)
-        # dataclass or object with attributes
         if dataclasses.is_dataclass(obj):
-            # try common shapes: obj.end or obj.start
             if hasattr(obj, 'end') and getattr(obj, 'end') is not None:
                 return _point_from(getattr(obj, 'end'))
             if hasattr(obj, 'line') or hasattr(obj, 'column'):
                 return {'line': getattr(obj, 'line', None), 'column': getattr(obj, 'column', None)}
             if hasattr(obj, 'start'):
                 return _point_from(getattr(obj, 'start'))
-        # generic object with attributes
         if hasattr(obj, 'line') or hasattr(obj, 'column'):
             return {'line': getattr(obj, 'line', None), 'column': getattr(obj, 'column', None)}
         if hasattr(obj, 'end'):
             return _point_from(getattr(obj, 'end'))
-        # last resort: return a deepcopy
         return copy.deepcopy(obj)
 
-    # If start_loc is a dict, return a new dict with its 'end' replaced by end_loc's end
     if isinstance(start_loc, dict):
         merged = copy.deepcopy(start_loc)
-        # If end_loc is dict with nested 'end', prefer that
         if isinstance(end_loc, dict):
             if 'end' in end_loc:
                 merged['end'] = copy.deepcopy(end_loc['end'])
             elif 'line' in end_loc or 'column' in end_loc:
                 merged['end'] = {'line': end_loc.get('line'), 'column': end_loc.get('column')}
             else:
-                # fallback: attempt extracting a point
                 merged['end'] = _point_from(end_loc)
         else:
-            # end_loc is an object/dc: try to extract its end-point
             merged['end'] = _point_from(end_loc)
         return merged
 
-    # If start_loc is a dataclass, try to use dataclasses.replace to set its 'end'
     if dataclasses.is_dataclass(start_loc):
-        # prefer using an 'end' attribute if present
         end_candidate = None
         if isinstance(end_loc, dict) and 'end' in end_loc:
             end_candidate = end_loc['end']
@@ -272,19 +226,14 @@ def _merge_source_locations(start_loc: Any, end_loc: Any) -> Any:
 
         try:
             if hasattr(start_loc, 'end'):
-                # Replace the end field. dataclasses.replace will create a new instance.
                 return dataclasses.replace(start_loc, end=end_candidate)
-            # If there is no 'end' field, try a few alternative end-field names
             potential = {}
             for name in ('line_end', 'col_end', 'column_end', 'end_line', 'end_column', 'offset_end'):
                 if hasattr(start_loc, name):
                     val = getattr(end_loc, name, None) if hasattr(end_loc, name) else None
                     if val is None:
-                        # try extracting from nested
                         pt = _point_from(end_loc)
-                        # choose a sensible scalar if available
                         if isinstance(pt, dict) and 'line' in pt and 'column' in pt:
-                            # choose line/column mapping heuristically
                             if name in ('line_end', 'end_line'):
                                 val = pt.get('line')
                             elif name in ('col_end', 'column_end', 'end_column'):
@@ -294,12 +243,9 @@ def _merge_source_locations(start_loc: Any, end_loc: Any) -> Any:
             if potential:
                 return dataclasses.replace(start_loc, **potential)
         except Exception:
-            # best-effort: fall through to returning start_loc unchanged
             pass
         return start_loc
 
-    # Fallback: start_loc is some other object (not dict, not dataclass)
-    # Attempt to construct a small dict with start from start_loc and end from end_loc
     try:
         start_pt = _point_from(start_loc)
         end_pt = _point_from(end_loc)
@@ -340,43 +286,79 @@ def _identify_function_entry_labels(
     """
     Heuristic: function entry labels come from:
       - program globals (explicit)
-      - call targets found in the linear_stream (call instructions)
-      - label references embedded in data sections (.init_array/.fini_array etc)
+      - call targets found anywhere in executable sections
+      - label references embedded ONLY in data sections (.init_array/.rodata/.fini_array etc)
+
+    Targets of jumps (conditional and unconditional) are explicitly excluded from
+    creating a function boundary, as they are treated exclusively as basic block leaders.
 
     Returns a dict mapping label_name -> is_boundary.
-    is_boundary is True if global, main/_start, or referenced in init/fini arrays.
     """
     globals_set = set(program_globals or [])
+
     call_targets: Set[str] = set()
-
-    for kind, node in linear_stream:
-        if kind == 'instr' and isinstance(node, Instruction):
-            if _is_call(node.opcode):
-                call_targets.update(_collect_operand_label_names(node))
-
-    label_names_in_stream: Set[str] = {
-        node.name for kind, node in linear_stream if kind == 'label' and isinstance(node, Label)
-    }
-
+    jump_targets: Set[str] = set()
     data_references: Set[str] = set()
     init_fini_references: Set[str] = set()
 
     if program_sections is not None:
-        try:
-            data_references = _collect_label_references_from_sections(program_sections)
-            # Specifically scan init/fini/preinit arrays for boundary classification
-            init_fini_sections = {'.init_array', '.fini_array', '.preinit_array'}
-            for sec in program_sections:
+        init_fini_sections = {'.init_array', '.fini_array', '.preinit_array'}
+        for sec in program_sections:
+            if _is_executable_section(sec):
+                # Scan executable sections for call and jump targets everywhere
+                for child in getattr(sec, 'children', []) or []:
+                    if isinstance(child, LabelGroup):
+                        for it in getattr(child, 'instructions', []) or []:
+                            if isinstance(it, Instruction):
+                                op = _opcode_family(it.opcode)
+                                if _is_call(op):
+                                    call_targets.update(_collect_operand_label_names(it))
+                                elif _is_branch(op) or _is_loop(op):
+                                    jump_targets.update(_collect_operand_label_names(it))
+                    elif isinstance(child, Function):
+                        for bb in getattr(child, 'basic_blocks', []) or []:
+                            for it in getattr(bb, 'instructions', []) or []:
+                                if isinstance(it, Instruction):
+                                    op = _opcode_family(it.opcode)
+                                    if _is_call(op):
+                                        call_targets.update(_collect_operand_label_names(it))
+                                    elif _is_branch(op) or _is_loop(op):
+                                        jump_targets.update(_collect_operand_label_names(it))
+            else:
+                # Conservative scan of pure DATA sections avoids bleeding jump/exec operands
+                # into the data references set.
+                for child in getattr(sec, 'children', []) or []:
+                    _extract_label_names_from_obj(child, data_references)
+                for item in getattr(sec, 'pseudo_instruct', []) or []:
+                    _extract_label_names_from_obj(item, data_references)
+
+                # Special boundary classification for init/fini arrays
                 if sec.name in init_fini_sections:
                     for child in getattr(sec, 'children', []) or []:
                         _extract_label_names_from_obj(child, init_fini_references)
                     for item in getattr(sec, 'pseudo_instruct', []) or []:
                         _extract_label_names_from_obj(item, init_fini_references)
-        except Exception:
-            data_references = set()
-            init_fini_references = set()
 
+    # Backup: Always scan the local linear stream in case there are missing sections/parents
+    for kind, node in linear_stream:
+        if kind == 'instr' and isinstance(node, Instruction):
+            op = _opcode_family(node.opcode)
+            if _is_call(op):
+                call_targets.update(_collect_operand_label_names(node))
+            elif _is_branch(op) or _is_loop(op):
+                jump_targets.update(_collect_operand_label_names(node))
+
+    label_names_in_stream: Set[str] = {
+        node.name for kind, node in linear_stream if kind == 'label' and isinstance(node, Label)
+    }
+
+    # Initial function boundary candidates
     candidates = (globals_set | call_targets | data_references) & label_names_in_stream
+
+    # Exclude direct jump targets so they strictly serve as basic block leaders inside functions,
+    # NOT function boundaries. We protect definitive globals/array-exports or targets genuinely `call`ed.
+    pure_jump_targets = jump_targets - (globals_set | init_fini_references | call_targets)
+    candidates = candidates - pure_jump_targets
 
     # Determine boundary status
     boundary_candidates = (globals_set | init_fini_references | {'main', '_start'}) & candidates
@@ -422,7 +404,6 @@ def _split_linear_stream_into_function_segments(
 def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_globals: List[str], bb_id_counter: itertools.count, entry_boundary_map: Dict[str, bool]) -> Optional[Function]:
     """
     Partition a function segment into BasicBlocks and return a Function.
-    Correctly calculates source location ranges for blocks and the function.
     """
     if not segment:
         return None
@@ -502,14 +483,12 @@ def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_glo
             bb.start_label = label_list[0]
 
         # --- Source Location Calculation for BasicBlock ---
-        # Start at the Label (if present) or the first Instruction
         loc_start = None
         if label_list and getattr(label_list[0], 'location', None):
             loc_start = label_list[0].location
         elif block_insts and getattr(block_insts[0], 'location', None):
             loc_start = block_insts[0].location
 
-        # End at the last Instruction
         loc_end = None
         if block_insts and getattr(block_insts[-1], 'location', None):
             loc_end = block_insts[-1].location
@@ -528,7 +507,6 @@ def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_glo
         func.is_boundary = entry_boundary_map.get(entry_label, False)
 
     # --- Source Location Calculation for Function ---
-    # Spans from first BasicBlock start to last BasicBlock end
     if basic_blocks:
         func_start = getattr(basic_blocks[0], 'location', None)
         func_end = getattr(basic_blocks[-1], 'location', None)
