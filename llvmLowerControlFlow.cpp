@@ -10,6 +10,7 @@ Control Flow
 - IRET
 - SYSRET
 - SYSCALL
+- HLT
 
 Conditional Jumps (Jcc family)
 - JE/JZ, JNE/JNZ
@@ -749,6 +750,10 @@ static void lowerTerminator(FnLowerCtx &LC, llvm::BasicBlock *BB, const lifted_a
                 } else {
                     B.CreateUnreachable();
                 }
+                emittedTerminator = true;
+            }
+            else if (opc == "HLT") {
+                B.CreateUnreachable();
                 emittedTerminator = true;
             }
         }

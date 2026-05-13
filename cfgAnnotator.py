@@ -47,6 +47,7 @@ CONDITIONAL_BRANCH_PREFIX = 'J'  # JE, JNE, JL, JG, JO, JZ, etc (but not JMP)
 CALL_OPS = {'CALL'}
 RETURN_OPS = {'RET'}
 LOOP_OPS = {'LOOP'}
+HLT_OPS = {'HLT'}
 
 def is_unconditional(opcode: str) -> bool:
     return opcode.upper() in UNCONDITIONAL_JUMPS
@@ -63,6 +64,9 @@ def is_return(opcode: str) -> bool:
 
 def is_loop(opcode: str) -> bool:
     return opcode.upper() in LOOP_OPS
+
+def is_hlt(opcode: str) -> bool:
+    return opcode.upper() in HLT_OPS
 
 # ---- Main enhancement pass -----------------------------------------------
 def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
@@ -191,7 +195,7 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                 if not instr:
                     return False
                 opc = (instr.opcode or '').upper()
-                if is_unconditional(opc) or is_conditional(opc) or is_return(opc) or is_call(opc) or is_loop(opc):
+                if is_unconditional(opc) or is_conditional(opc) or is_return(opc) or is_call(opc) or is_loop(opc) or is_hlt(opc):
                     return True
                 if getattr(instr, 'target_blocks', None):
                     return True
@@ -228,7 +232,7 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                 # conditional fallthrough to next block
                 if idx + 1 < len(ordered_bb_ids):
                     targets.append(ordered_bb_ids[idx + 1])
-            elif is_return(opcode):
+            elif is_return(opcode) or is_hlt(opcode):
                 targets = []
             elif is_call(opcode):
                 # control returns to next block after call (fallthrough)
