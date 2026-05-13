@@ -103,6 +103,7 @@ message Operand {
   optional bool via_got = 9;
   optional string inferred_type = 10;
   optional string address_refinement = 11;
+  optional string wrt = 12;
 }
 
 message Memory {
