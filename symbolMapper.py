@@ -60,6 +60,33 @@ def format_llvm_constant(val: Union[int, str, float], type_hint: Optional[str] =
         return f'c"{val}"'
     return str(val)
 
+def parse_int(val: Union[str, int]) -> int:
+    """Safely parses integers, natively supporting NASM/MASM hex ('h') and binary ('b') suffixes."""
+    if isinstance(val, int):
+        return val
+    val = str(val).strip()
+    if not val:
+        return 0
+
+    # Extract optional sign
+    sign = 1
+    if val.startswith('-'):
+        sign = -1
+        val = val[1:]
+    elif val.startswith('+'):
+        val = val[1:]
+
+    val_lower = val.lower()
+    if val_lower.endswith('h'):
+        return sign * int(val[:-1], 16)
+    elif val_lower.endswith('b') and all(c in '01' for c in val[:-1]):
+        return sign * int(val[:-1], 2)
+    else:
+        # Reattach sign for standard base 0 parsing (handles 0x, 0b natively)
+        if sign == -1:
+            val = '-' + val
+        return int(val, 0)
+
 # ---------------------------------------------------------------------------
 # Core Analysis Logic
 # ---------------------------------------------------------------------------
@@ -145,8 +172,67 @@ class SymbolMapper:
                             entry = self._ensure_symbol_entry(bb.start_label.name, 'label')
                             entry['section'] = sec.name
 
+    def _collect_missing_symbols(self) -> set:
+        """Collects all symbols referenced in code instructions or globals that are not yet defined."""
+        missing = set()
+        for sec in self.program.sections:
+            for child in sec.children:
+                if isinstance(child, Function):
+                    for bb in child.basic_blocks:
+                        for instr in bb.instructions:
+                            for op in instr.operands:
+                                sym_name = None
+                                if getattr(op, 'symbol_ref', None):
+                                    sym_name = getattr(op.symbol_ref, 'name', op.symbol_ref)
+                                    if not isinstance(sym_name, str):
+                                        sym_name = str(sym_name)
+                                elif getattr(op, 'memory', None) and getattr(op.memory, 'displacement', None):
+                                    disp = op.memory.displacement
+                                    if isinstance(disp, str) and not disp.isdigit():
+                                        sym_name = disp
+                                elif getattr(op, 'expression', None) and isinstance(op.expression, str):
+                                    sym_name = op.expression
+
+                                if sym_name and sym_name not in self.symbol_table:
+                                    missing.add(sym_name)
+
+        for g in self.program.globals:
+            if g not in self.symbol_table:
+                missing.add(g)
+
+        # Filter out common known registers or non-identifier tokens that may have been incorrectly caught
+        ignore_set = {'RAX','RBX','RCX','RDX','RSP','RBP','RSI','RDI','RIP',
+                      'EAX','EBX','ECX','EDX','ESP','EBP','ESI','EDI',
+                      'AX','BX','CX','DX','SP','BP','SI','DI',
+                      'AL','BL','CL','DL','AH','BH','CH','DH',
+                      'R8','R9','R10','R11','R12','R13','R14','R15',
+                      'R8D','R9D','R10D','R11D','R12D','R13D','R14D','R15D',
+                      '$'}
+        return {s for s in missing if s.upper() not in ignore_set and re.match(r'^[a-zA-Z_.$][a-zA-Z0-9_.$]*$', s)}
+
+    def _create_fallback_definitions(self, missing_symbols: set):
+        """Generates fallback 'zeroinitializer' allocations for unrecovered symbols."""
+        for sym in missing_symbols:
+            if sym in self.symbol_table:
+                continue
+            entry = self._ensure_symbol_entry(sym, 'data')
+            is_global = sym in self.program.globals
+
+            entry['visibility'] = 'global' if is_global else 'local'
+            # Leverage weak linkage to prevent conflicts if mapped via external linked scripts implicitly (like `_end`)
+            entry['linkage'] = 'weak' if is_global else 'internal'
+            entry['llvm_type'] = '[8 x i8]'
+            entry['value'] = 'zeroinitializer'
+            entry['section'] = '.bss'
+
+            if 'rodata' in sym:
+                entry['section'] = '.rodata'
+                entry['is_constant'] = True
+
     def _process_data_sections(self):
         """Processes .data, .rodata, .bss, .init_array, .fini_array."""
+        missing_symbols = self._collect_missing_symbols()
+
         for sec_name in ['.data', '.rodata', '.bss']:
             sec = self.section_map.get(sec_name)
             if not sec:
@@ -155,7 +241,10 @@ class SymbolMapper:
                 if isinstance(child, DataGroup):
                     self._parse_datagroup(child, sec_name)
             if not sec.children and sec.pseudo_instruct:
-                self._parse_legacy_pseudo_data(sec, sec_name)
+                self._parse_legacy_pseudo_data(sec, sec_name, missing_symbols)
+
+        # Fill in anything left out completely (e.g. globals only defined via runtime or custom structures)
+        self._create_fallback_definitions(missing_symbols)
 
     def _process_ctors_dtors(self):
         """
@@ -191,7 +280,7 @@ class SymbolMapper:
         handle_array('.init_array', 'llvm.global_ctors')
         handle_array('.fini_array', 'llvm.global_dtors')
 
-        # Fix: Remove the explicit .init_array/.fini_array sections now that their
+        # Remove the explicit .init_array/.fini_array sections now that their
         # intent is captured by llvm.global_ctors/dtors in the symbol table.
         self.program.sections = [s for s in self.program.sections if s.name not in ('.init_array', '.fini_array')]
         # Update the section map for internal consistency
@@ -237,9 +326,7 @@ class SymbolMapper:
     def _commit_symbol_data(self, name: str, directives: List[DataDirective], section_name: str):
         """
         Processes a list of DataDirectives into a symbol table entry.
-        Applies the same fixes as _commit_legacy_data:
-        1. is_constant only for .rodata.
-        2. Single values (even bytes) emitted as scalars, not [1 x type].
+        Applies the same fixes as _commit_legacy_data.
         """
         if not directives:
             return
@@ -262,12 +349,10 @@ class SymbolMapper:
                     for c in s:
                         flat_values.append(ord(c))
                 elif isinstance(op, Expression):
-                    # Complex expression - skipped for simple value derivation
                     pass
 
         entry = self._ensure_symbol_entry(name, 'data')
         entry['section'] = section_name
-        # FIX 1: Only set is_constant for .rodata. .data is writable.
         if section_name == '.rodata':
             entry['is_constant'] = True
 
@@ -275,8 +360,6 @@ class SymbolMapper:
         if string_const is not None:
             entry['value'] = string_const
             entry['llvm_type'] = f'[{len(flat_values)} x i8]'
-            # Removed: entry['is_constant'] = True (Fix 1)
-        # FIX 2: Emit single values as scalars (including single bytes).
         elif len(flat_values) == 1:
             entry['llvm_type'] = type_hint
             entry['value'] = format_llvm_constant(flat_values[0], type_hint)
@@ -291,14 +374,32 @@ class SymbolMapper:
         else:
             entry['linkage'] = 'internal'
 
-    def _parse_legacy_pseudo_data(self, sec: Section, section_name: str):
+    def _parse_legacy_pseudo_data(self, sec: Section, section_name: str, missing_symbols: set):
         """Handles data present in pseudo_instruct (seen in sample input)."""
+        unnamed_counter = 0
         for pseudo in sec.pseudo_instruct:
             if not isinstance(pseudo, dict):
                 continue
+
             name = pseudo.get('name')
+
+            # Predict missing label dynamically when earlier AST skips assigning valid names upstream
             if not name:
-                continue
+                candidates = []
+                if section_name == '.rodata':
+                    candidates = [s for s in missing_symbols if 'rodata' in s]
+                elif section_name == '.bss':
+                    candidates = [s for s in missing_symbols if s in ('__TMC_END__', 'Ltemp_storage_foxdec') or 'bss' in s]
+                elif section_name == '.data':
+                    candidates = [s for s in missing_symbols if s in ('__data_start', '__dso_handle') or 'data' in s]
+
+                if candidates:
+                    candidates.sort()
+                    name = candidates[0]
+                    missing_symbols.remove(name)
+                else:
+                    unnamed_counter += 1
+                    name = f"__unnamed_{section_name.strip('.')}_{unnamed_counter}"
 
             dx = pseudo.get('dx')
             resx = pseudo.get('resx')
@@ -306,17 +407,15 @@ class SymbolMapper:
             integer_val = pseudo.get('integer')
 
             if equ:
-                # Explicitly force kind to 'constant' to override any incorrect 'data' classification from input
                 entry = self._ensure_symbol_entry(name, 'constant')
                 entry['kind'] = 'constant'
                 entry['visibility'] = 'local'
                 if name in self.program.globals:
                     entry['visibility'] = 'global'
-                
+
                 if 'integer' in equ:
                     val = equ['integer']['value']
-                    # Using base=0 smartly parses prefixes like 0x automatically
-                    entry['value'] = int(val, 0) if isinstance(val, str) else int(val)
+                    entry['value'] = parse_int(val)
                     entry['llvm_type'] = 'i64'
                 elif 'expression' in equ:
                     expr = equ['expression']
@@ -342,23 +441,27 @@ class SymbolMapper:
                 int_obj = pseudo.get('integer')
                 if int_obj and isinstance(int_obj, dict):
                     val = int_obj.get('value', 1)
-                    count = int(val, 0) if isinstance(val, str) else int(val)
+                    count = parse_int(val)
                 base = resx[3:].lower()
                 llvm_type_str = LLVM_RES_TYPES.get(base, 'i8')
                 entry = self._ensure_symbol_entry(name, 'data')
                 entry['section'] = section_name
                 entry['value'] = 'zeroinitializer'
-                entry['linkage'] = 'internal'
+
+                if name in self.program.globals:
+                    entry['visibility'] = 'global'
+                    entry['linkage'] = 'global'
+                else:
+                    entry['linkage'] = 'internal'
+
                 if count == 1:
                     entry['llvm_type'] = llvm_type_str
                 else:
                     entry['llvm_type'] = f'[{count} x {llvm_type_str}]'
-                if name in self.program.globals:
-                    entry['visibility'] = 'global'
 
             elif integer_val:
                 val = integer_val.get('value', 0)
-                val = int(val, 0) if isinstance(val, str) else int(val)
+                val = parse_int(val)
                 entry = self._ensure_symbol_entry(name, 'constant')
                 entry['value'] = str(val)
                 entry['llvm_type'] = 'i64'
@@ -374,16 +477,12 @@ class SymbolMapper:
         for v in values:
             if isinstance(v, dict):
                 if 'string' in v:
-                    # Ensure string parsing is robust.
-                    # The input AST often has the string content quoted: "\"...\""
-                    # We need to strip the outer quotes to get the actual content bytes.
                     s = v['string'].strip('"')
                     for c in s:
                         flat_values.append(ord(c))
                 elif 'integer' in v:
                     val = v['integer']['value']
-                    # Using base=0 smartly parses prefixes like 0x automatically
-                    flat_values.append(int(val, 0) if isinstance(val, str) else int(val))
+                    flat_values.append(parse_int(val))
                 elif 'float' in v:
                     is_float = True
                     type_hint = LLVM_FLOAT_TYPES[kind.lower()]
@@ -396,13 +495,10 @@ class SymbolMapper:
         if section_name == '.rodata':
             entry['is_constant'] = True
 
-        # Prefer string constant format when possible
         string_const = self._format_string_constant(flat_values)
         if string_const is not None:
             entry['value'] = string_const
             entry['llvm_type'] = f'[{len(flat_values)} x i8]'
-            # Removed: entry['is_constant'] = True
-            # Emit single values as scalars (including single bytes).
         elif len(flat_values) == 1:
             entry['llvm_type'] = type_hint
             entry['value'] = format_llvm_constant(flat_values[0], type_hint)
@@ -427,7 +523,9 @@ class SymbolMapper:
                             for op in instr.operands:
                                 sym_name = None
                                 if op.symbol_ref:
-                                    sym_name = op.symbol_ref.name
+                                    sym_name = getattr(op.symbol_ref, 'name', op.symbol_ref)
+                                    if not isinstance(sym_name, str):
+                                        sym_name = str(sym_name)
                                 elif getattr(op, 'expression', None) and isinstance(op.expression, str):
                                     sym_name = op.expression
 
@@ -436,9 +534,8 @@ class SymbolMapper:
 
                                 sym = self.symbol_table[sym_name]
                                 # Constants (equ) generate no relocations.
-                                # This check now works because we fixed the 'kind' to 'constant' in _parse_legacy_pseudo_data.
                                 if sym.get('kind') == 'constant':
-                                    continue  # immediates need no relocation
+                                    continue
 
                                 relocs = sym.get('relocations', [])
                                 reloc_type = 'unknown'
@@ -448,9 +545,8 @@ class SymbolMapper:
                                     if sym.get('is_external'):
                                         reloc_type = 'plt32'
                                     else:
-                                        continue  # internal direct call/branch – no relocation
+                                        continue
                                 elif sym.get('kind') == 'data':
-                                    # Prioritize GOT access over generic RIP-relative access.
                                     if op.via_got:
                                         reloc_type = 'gotpcrel'
                                         pic = True
@@ -458,7 +554,6 @@ class SymbolMapper:
                                         reloc_type = 'pc32'
                                         pic = True
                                     else:
-                                        # Fallback for absolute or non-RIP memory references (rare in x64 PIC)
                                         reloc_type = 'pc32'
                                         pic = True
 

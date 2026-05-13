@@ -93,9 +93,7 @@ static std::string toUpper(std::string s) {
 
 static std::optional<int64_t> parseInt64Loose(const std::string &s0) {
   std::string s = s0;
-  auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
-  while (!s.empty() && isSpace((unsigned char)s.front())) s.erase(s.begin());
-  while (!s.empty() && isSpace((unsigned char)s.back())) s.pop_back();
+
   if (s.empty()) return std::nullopt;
 
   int base = 10;
@@ -103,6 +101,15 @@ static std::optional<int64_t> parseInt64Loose(const std::string &s0) {
 
   char *end = nullptr;
   errno = 0;
+
+  if (base == 16) {
+    unsigned long long uv = std::strtoull(s.c_str(), &end, 16);
+    if (errno == 0 && end != s.c_str() && *end == '\0') {
+      return (int64_t)uv;
+    }
+  }
+
+  // decimal fallback (original signed path)
   long long v = std::strtoll(s.c_str(), &end, base);
   if (errno != 0 || end == s.c_str() || *end != '\0') return std::nullopt;
   return (int64_t)v;
@@ -592,6 +599,30 @@ static MemAddr resolveMemAddress(FnLowerCtx &LC, IRBuilder<> &B, const lifted_as
     out.ptr = basePtr;
     out.align = llvm::Align(1);
     return out;
+  }
+
+  // RIP-relative symbolic PIC reference (the exact case the review described)
+  // base == "RIP" and displacement holds the symbol name (no top-level symbol_ref).
+  if (base == "RIP" && m.has_displacement()) {
+    const auto& disp = m.displacement();
+    std::string sym;
+    if (disp.kind_case() == google::protobuf::Value::kStringValue) {
+      sym = disp.string_value();
+    } else {
+      auto sOpt = structStringField(disp, "symbol");
+      if (sOpt) sym = *sOpt;
+    }
+    if (!sym.empty() &&
+        (LC.M.getNamedGlobal(sym) != nullptr ||
+         LC.M.getFunction(sym) != nullptr ||
+         LC.P->symbol_table().count(sym))) {
+      llvm::Value* basePtr = symbolAddressAsPtr(LC, B, sym, astInstrId);
+      out.isSymbolic = true;
+      out.symName = sym;
+      out.ptr = basePtr;
+      out.align = llvm::Align(1);
+      return out;
+    }
   }
 
   // General computed
