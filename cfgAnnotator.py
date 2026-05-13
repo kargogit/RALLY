@@ -1,13 +1,10 @@
-## cfgAnnotator.py
 # Enhance typed-AST-based program with navigation, CFG links and symbol table.
 # Reads a legacy-program dict JSON from stdin, deserializes to typed AST using
 # legacy_program_dict_to_ast, mutates the AST to add enhancements, and writes
 # the legacy-program dict (with enhancements) to stdout.
-
 import sys
 import json
 from typing import Dict, List, Tuple, Any, Optional, Iterable
-
 # Import typed-ast helpers
 from astNodes import (
     legacy_program_dict_to_ast,
@@ -21,77 +18,66 @@ from astNodes import (
     Operand,
     Memory,
 )
-
 # ---- Utility helpers -----------------------------------------------------
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
-
 def unique_id(prefix: str, counter: List[int]) -> str:
     counter[0] += 1
     return f"{prefix}{counter[0]}"
-
 def iter_program_sections(program: Program) -> Iterable[Section]:
     for sec in program.sections:
         yield sec
-
 def find_globals(program_legacy: Dict[str, Any]) -> List[str]:
     # this helper expects the raw legacy dict shape (we call it only on the raw input)
     items = program_legacy.get('program', [])
     if len(items) >= 2 and isinstance(items[1], dict) and 'globals' in items[1]:
         return items[1]['globals']
     return []
-
 # ---- Opcode classification (simple, conservative) ------------------------
 UNCONDITIONAL_JUMPS = {'JMP'}
-CONDITIONAL_BRANCH_PREFIX = 'J'  # JE, JNE, JL, JG, JO, JZ, etc (but not JMP)
+CONDITIONAL_BRANCH_PREFIX = 'J' # JE, JNE, JL, JG, JO, JZ, etc (but not JMP)
 CALL_OPS = {'CALL'}
 RETURN_OPS = {'RET'}
 LOOP_OPS = {'LOOP'}
 HLT_OPS = {'HLT'}
-
 def is_unconditional(opcode: str) -> bool:
     return opcode.upper() in UNCONDITIONAL_JUMPS
-
 def is_conditional(opcode: str) -> bool:
     up = opcode.upper()
     return up.startswith(CONDITIONAL_BRANCH_PREFIX) and up not in UNCONDITIONAL_JUMPS
-
 def is_call(opcode: str) -> bool:
     return opcode.upper() in CALL_OPS
-
 def is_return(opcode: str) -> bool:
     return opcode.upper() in RETURN_OPS
-
 def is_loop(opcode: str) -> bool:
     return opcode.upper() in LOOP_OPS
-
 def is_hlt(opcode: str) -> bool:
     return opcode.upper() in HLT_OPS
-
 # ---- Main enhancement pass -----------------------------------------------
 def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
     # Deserialize into typed AST; request include_enhancements=True so we
     # pick up any pre-existing enhancement fields (they are stored in
     # _temp_* attributes and will be handled).
     ast_prog: Program = legacy_program_dict_to_ast(legacy, include_enhancements=True)
-
+    # Establish parent ownership for sections to support complete upward navigation
+    # (program → sections → functions → basic blocks → instructions) as required
+    # for the CFG-aware representation.
+    for sec in ast_prog.sections:
+        sec.parent = ast_prog
     # Counters for stable IDs
     fid_ctr = [0]
     bb_ctr = [0]
     instr_ctr = [0]
-
     # Maps used during enhancement
     func_map: Dict[str, Function] = {}
-    bb_map: Dict[str, BasicBlock] = {}    # bb_id -> BasicBlock
-    instr_map: Dict[str, Instruction] = {}  # instr_id -> Instruction
+    bb_map: Dict[str, BasicBlock] = {} # bb_id -> BasicBlock
+    instr_map: Dict[str, Instruction] = {} # instr_id -> Instruction
     label_def_map: Dict[str, Dict[str, Any]] = {}
     data_symbol_map: Dict[str, Dict[str, Any]] = {}
     extern_symbols: set[str] = set()
-
     # gather globals from original legacy dict (so visibility decisions match)
     globals_list = find_globals(legacy)
     global_set = set(globals_list or [])
-
     # First pass: collect data/extern symbols from section pseudo_instructs,
     # and record label-groups (LabelGroup) label definitions.
     for sec in iter_program_sections(ast_prog):
@@ -106,7 +92,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(params, list):
                         for p in params:
                             extern_symbols.add(p)
-
     # Process sections and functions: assign function IDs, bb IDs, instr IDs,
     # and normalize operands (RIP/GOT handling)
     for sec in ast_prog.sections:
@@ -122,7 +107,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                 # ensure function.parent is the Section (serializer expects this)
                 func.parent = sec
                 func_map[func_id] = func
-
                 # process basic blocks and instructions
                 for bb in func.basic_blocks:
                     # assign id if missing
@@ -138,14 +122,12 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                             'bb_id': bb.id,
                             'section': sec.name
                         }
-
                     # instructions: ensure ids and parents, and normalize operands
                     for instr in bb.instructions:
                         if not instr.id:
                             instr.id = unique_id("instr_", instr_ctr)
                         instr.parent = bb
                         instr_map[instr.id] = instr
-
                         # Normalize operands:
                         # 1. Convert LEA with bare label expression to RIP-relative memory (common under default rel)
                         # 2. Then handle existing RIP/GOT memory operands
@@ -169,7 +151,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                                             if sym:
                                                 mem.displacement = sym
                                                 op.via_got = True
-
     # Handle .init_array / .fini_array references (pseudo_instruct values)
     for sec in ast_prog.sections:
         for pi in sec.pseudo_instruct or []:
@@ -180,10 +161,8 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                         label_def_map[sym].setdefault('referenced_by', []).append({
                             'section': sec.name, 'pseudo': pi
                         })
-
     # label_to_bb mapping (for quick resolve)
     label_to_bb: Dict[str, str] = {lbl: info['bb_id'] for lbl, info in label_def_map.items() if 'bb_id' in info}
-
     # CFG construction (successors, terminators, target_blocks)
     for func_id, func in func_map.items():
         ordered_bbs = func.basic_blocks
@@ -245,14 +224,14 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                     targets.append(ordered_bb_ids[idx + 1])
             # Annotate indirect terminators with metadata and deferred-analysis hints
             if last_instr and last_instr.operands:
-                opc = opcode  # already uppercased
+                opc = opcode # already uppercased
                 if is_unconditional(opc) or is_conditional(opc) or is_loop(opc) or is_call(opc):
                     target_op = last_instr.operands[0]
                     resolved = resolve_operand_target(target_op)
                     if resolved is None and getattr(target_op, 'name', None) is None:
                         # Truly indirect (register or memory target, not a direct symbol/name)
                         last_instr.indirect_jump_kind = "unknown" if is_call(opc) else "intraprocedural"
-                        last_instr.indirect_targets = []  # Placeholder – later steps can populate via data-flow
+                        last_instr.indirect_targets = [] # Placeholder – later steps can populate via data-flow
             # Populate last_instr.target_blocks for branches (non-calls)
             if direct_target_found and not is_call(opcode):
                 instr_targets = []
@@ -273,7 +252,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                     if tid in bb_map:
                         succs.append(bb_map[tid])
             bb.successors = succs
-
         # Separate pass: annotate target_blocks on ALL CALL instructions (internal direct calls)
         for bb in func.basic_blocks:
             for instr in bb.instructions:
@@ -288,7 +266,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                             instr_targets.append(t_id)
                     if instr_targets:
                         instr.target_blocks = [bb_map[t_id] for t_id in instr_targets if t_id in bb_map]
-
     # Predecessors (invert successors)
     for bb in bb_map.values():
         bb.predecessors = bb.predecessors or []
@@ -297,7 +274,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
             for succ in bb.successors:
                 if bb.id not in [p.id for p in succ.predecessors]:
                     succ.predecessors.append(bb)
-
     # Unified symbol catalog (defined + external)
     symbol_catalog: Dict[str, Dict[str, Any]] = {}
     for name, info in data_symbol_map.items():
@@ -307,7 +283,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
         symbol_catalog[label_name] = {'kind': kind, 'def': info, 'visibility': 'global' if label_name in global_set else 'local'}
     for ext in sorted(extern_symbols):
         symbol_catalog[ext] = {'kind': 'external', 'visibility': 'global'}
-
     # Centralized operand symbol_ref annotation + external kind inference
     # We'll also create a label_map for quick mapping to Label objects (existing labels)
     label_map: Dict[str, Label] = {}
@@ -317,7 +292,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                 for bb in child.basic_blocks:
                     if bb.start_label:
                         label_map[bb.start_label.name] = bb.start_label
-
     for instr in instr_map.values():
         opc = (instr.opcode or '').upper()
         is_call_instr = is_call(opc)
@@ -348,7 +322,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                     usage_kind = 'data'
             if sym and symbol_catalog.get(sym, {}).get('kind') == 'external' and usage_kind:
                 symbol_catalog[sym]['kind'] = usage_kind
-
     # Program-level symbol table (legacy dict-shaped)
     program_symbol_table: Dict[str, Any] = {}
     # Functions
@@ -371,7 +344,9 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
             rec['definition'] = {'bb_id': info['bb_id'], 'section': info.get('section')}
         else:
             rec['definition'] = {'defined_in': info.get('defined_in'), 'section': info.get('section'), 'raw': info.get('definition')}
-        program_symbol_table[name] = rec
+        if name not in program_symbol_table or program_symbol_table[name].get('kind') != 'function':
+            program_symbol_table[name] = rec
+        # else: preserve richer function metadata (func_id, entry_bb, etc.) set in the functions pass above
     # Data symbols
     for name, info in data_symbol_map.items():
         program_symbol_table.setdefault(name, {
@@ -386,7 +361,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
             'kind': cat_kind,
             'visibility': 'global'
         }
-
     # Local label scoping (scoped_to anchors)
     for sec in ast_prog.sections:
         anchor = None
@@ -404,7 +378,6 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                         else:
                             if sbl in program_symbol_table:
                                 program_symbol_table[sbl].setdefault('scoped_to', anchor)
-
     # Attach symbol table and id_maps to AST program so ast_to_legacy_program_dict can include them
     ast_prog.symbol_table = program_symbol_table
     # id_maps in legacy shape
@@ -415,11 +388,9 @@ def build_enhanced_program(legacy: Dict[str, Any]) -> Dict[str, Any]:
                          for bbid in bb_map},
     }
     ast_prog.id_maps = id_maps
-
     # Finally serialize back to legacy dict with enhancements included
     legacy_out = ast_to_legacy_program_dict(ast_prog, include_instr_locations=False, include_enhancements=True)
     return legacy_out
-
 # ---- CLI entrypoint -----------------------------------------------------
 def main():
     try:
@@ -438,6 +409,5 @@ def main():
     except Exception as exc:
         eprint("Unexpected error while enhancing AST:", repr(exc))
         raise
-
 if __name__ == '__main__':
     main()
