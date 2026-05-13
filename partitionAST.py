@@ -1,555 +1,578 @@
 """
-Step 3: Partition typed AST (from astNodes.py) into Functions & BasicBlocks.
+partitionAST.py
+Step 3: Partition typed AST into Functions & BasicBlocks.
+
+This is the synthesized best version that resolves all reported issues with
+the frame_dummy / L1130_1 backward-jump thunk pattern (and similar real-world
+compiler-generated layouts).
+
+Key fixes:
+  - Correct function boundary detection (globals + call targets + .init_array/.fini_array)
+  - Backward-jump ownership repair: moves earlier "orphan" helper blocks (L1130_1 etc.)
+    into the owning function (frame_dummy) even though they appear earlier in the binary.
+  - Full connected-component relocation for chains of internal labels.
+  - Function entry name = the externally visible symbol (frame_dummy, not L1130_1).
+  - Clean leader-based BB partitioning that works for both normal and thunk layouts.
+  - Robust label regex, more executable sections, safe merging, etc.
+  - FIX: Non-local jump targets are promoted to function entries ONLY when they
+    fall outside the linear span of every base-function that branches to them.
+    Targets inside the jumping function's span (e.g. error_exit, do_exit) stay
+    internal; targets outside (e.g. report_error jumped to from main but located
+    before main) become separate functions.
 
 Usage:
     cat primitiveAST.json | python partitionAST.py > enhancedAST.json
 """
 
+from __future__ import annotations
+
 from typing import List, Dict, Any, Optional, Tuple, Set, Iterable
 import itertools
-import uuid
 import dataclasses
 import re
 import copy
 
-# Import dataclasses/types from astNodes.py (must be in same PYTHONPATH)
 from astNodes import (
     Program,
     Section,
     LabelGroup,
     Label,
     Instruction,
-    Immediate,
     BasicBlock,
     Function,
     ast_to_legacy_program_dict,
-    legacy_program_dict_to_ast
+    legacy_program_dict_to_ast,
 )
 
-_LABEL_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+_LABEL_RE = re.compile(r"^[A-Za-z_\.][A-Za-z0-9_\.@$]*$")
 
-# Config: which section names are considered executable (partitioned)
-DEFAULT_EXECUTABLE_SECTIONS = {'.text'}
+DEFAULT_EXECUTABLE_SECTIONS = {
+    ".text", ".init", ".fini", ".plt", ".plt.sec",
+    ".text.startup", ".text.hot", ".text.unlikely"
+}
+
+INIT_FINI_SECTIONS = {".init_array", ".fini_array", ".preinit_array"}
 
 
-# -------------------------
-# Helper functions
-# -------------------------
-def _extract_label_names_from_obj(obj, found: Set[str]) -> None:
-    """
-    Recursively inspect obj to find label-like strings and .name attributes.
-    Adds candidates to `found`. Conservative: only accepts strings that match _LABEL_RE.
-    Works for dicts, lists/tuples, dataclasses, and generic objects with attributes.
-    """
-    if obj is None:
-        return
-
-    # If it's already a known label-name string
-    if isinstance(obj, str):
-        if _LABEL_RE.match(obj):
-            found.add(obj)
-        return
-
-    # If it's a dataclass, convert to dict to walk fields (safe)
-    if dataclasses.is_dataclass(obj):
-        try:
-            od = dataclasses.asdict(obj)
-        except Exception:
-            # fallback to attribute iteration
-            od = {k: getattr(obj, k) for k in dir(obj) if not k.startswith('_')}
-        _extract_label_names_from_obj(od, found)
-        return
-
-    # If it's a dict: walk values
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _extract_label_names_from_obj(v, found)
-        return
-
-    # If it's a list/tuple/set: iterate elements
-    if isinstance(obj, (list, tuple, set)):
-        for v in obj:
-            _extract_label_names_from_obj(v, found)
-        return
-
-    # If it has a .name attribute that's a string, collect it
-    name = getattr(obj, 'name', None)
-    if isinstance(name, str) and _LABEL_RE.match(name):
-        found.add(name)
-
-    # If it has an 'operands' attribute (Instruction-like or data directive),
-    # inspect it (covers cases like Instruction.operands or DataDirective.items).
-    operands = getattr(obj, 'operands', None)
-    if operands is not None:
-        _extract_label_names_from_obj(operands, found)
-
-    # Also try common names that may contain label refs (e.g., 'value', 'items', 'args')
-    for attr in ('value', 'values', 'items', 'args', 'operands', 'displacement', 'label'):
-        if hasattr(obj, attr):
-            _extract_label_names_from_obj(getattr(obj, attr), found)
-
-    # As a last resort, inspect simple public attributes (avoid callables, dunder)
-    # but do this sparingly to avoid huge recursion/side effects.
-    try:
-        for k in dir(obj):
-            if k.startswith('_'):
-                continue
-            # skip methods and descriptors
-            v = getattr(obj, k)
-            if callable(v):
-                continue
-            # small heuristic: only inspect simple attributes (str, dict, list, dataclass)
-            if isinstance(v, (str, dict, list, tuple, set)) or dataclasses.is_dataclass(v):
-                _extract_label_names_from_obj(v, found)
-    except Exception:
-        # swallow inspection errors (robust best-effort)
-        pass
-
+# ====================== HELPERS ======================
 
 def _is_executable_section(section: Section) -> bool:
     return section.name in DEFAULT_EXECUTABLE_SECTIONS
 
 
-def _opcode_family(opcode: str) -> str:
-    """Return normalized opcode family (lowercase). Safe for None."""
-    if not opcode:
-        return ''
-    return opcode.lower()
+def _opcode(op: Optional[str]) -> str:
+    return (op or "").lower()
 
 
-def _is_unconditional_jump(opcode: str) -> bool:
-    """Detect unconditional jump opcodes. Conservative: startswith 'jmp'."""
-    o = _opcode_family(opcode)
-    return o.startswith('jmp')
+def _is_ret(op: str) -> bool:
+    return _opcode(op) in {"ret", "retq", "retn", "retl"}
 
 
-def _is_return(opcode: str) -> bool:
-    """Detect return opcodes."""
-    o = _opcode_family(opcode)
-    return o in ('ret', 'retq', 'retn', 'retl')
+def _is_call(op: str) -> bool:
+    o = _opcode(op)
+    return o == "call" or o.startswith("call")
 
 
-def _is_call(opcode: str) -> bool:
-    o = _opcode_family(opcode)
-    return o == 'call' or o.startswith('call')
+def _is_uncond_jmp(op: str) -> bool:
+    return _opcode(op).startswith("jmp")
 
 
-def _is_loop(opcode: str) -> bool:
-    """
-    Detect loop-family instructions (loop, loope/loopz, loopne/loopnz).
-    Conservative: treat any opcode that starts with 'loop' as a loop-branch.
-    """
-    o = _opcode_family(opcode)
-    return o.startswith('loop')
+def _is_cond_jmp(op: str) -> bool:
+    o = _opcode(op)
+    return o.startswith("j") and not _is_uncond_jmp(o)
 
 
-def _is_branch(opcode: str) -> bool:
-    """
-    Consider conditional and unconditional jump-like opcodes:
-    - conditional: 'je', 'jne', 'jg', etc. (start with 'j' but not 'jmp')
-    - unconditional: 'jmp' handled separately
-    We'll treat any opcode starting with 'j' as branch.
-    """
-    o = _opcode_family(opcode)
-    return (o.startswith('j') and not _is_unconditional_jump(o)) or _is_unconditional_jump(o)
+def _is_loop(op: str) -> bool:
+    return _opcode(op).startswith("loop")
+
+
+def _is_any_jumpish(op: str) -> bool:
+    return _is_cond_jmp(op) or _is_uncond_jmp(op) or _is_loop(op)
 
 
 def _collect_operand_label_names(instr: Instruction) -> Set[str]:
-    """Return set of operand label names referenced by an instruction."""
-    names: Set[str] = set()
-    for op in instr.operands:
-        if getattr(op, 'name', None):
-            names.add(op.name)
-        # memory displacement or expression could embed names as strings;
-        # best-effort: check .memory.displacement if it's a string
-        mem = getattr(op, 'memory', None)
+    out: Set[str] = set()
+    for op in getattr(instr, "operands", []) or []:
+        nm = getattr(op, "name", None)
+        if isinstance(nm, str) and _LABEL_RE.match(nm):
+            out.add(nm)
+        mem = getattr(op, "memory", None)
         if mem is not None:
-            disp = getattr(mem, 'displacement', None)
-            if isinstance(disp, str):
-                names.add(disp)
-    return names
+            disp = getattr(mem, "displacement", None)
+            if isinstance(disp, str) and _LABEL_RE.match(disp):
+                out.add(disp)
+    return out
+
+
+def _extract_label_names_from_obj(obj: Any, found: Set[str]) -> None:
+    if obj is None:
+        return
+    if isinstance(obj, str):
+        if _LABEL_RE.match(obj):
+            found.add(obj)
+        return
+    if dataclasses.is_dataclass(obj):
+        try:
+            _extract_label_names_from_obj(dataclasses.asdict(obj), found)
+        except Exception:
+            for k in dir(obj):
+                if k.startswith("_") or callable(getattr(obj, k, None)):
+                    continue
+                _extract_label_names_from_obj(getattr(obj, k, None), found)
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _extract_label_names_from_obj(v, found)
+        return
+    if isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            _extract_label_names_from_obj(v, found)
+        return
+
+    nm = getattr(obj, "name", None)
+    if isinstance(nm, str) and _LABEL_RE.match(nm):
+        found.add(nm)
+    for attr in ("value", "values", "items", "args", "operands", "displacement", "label"):
+        if hasattr(obj, attr):
+            _extract_label_names_from_obj(getattr(obj, attr), found)
 
 
 def _merge_source_locations(start_loc: Any, end_loc: Any) -> Any:
-    """
-    Create a new SourceLocation that spans from the start of `start_loc` to the
-    end of `end_loc`. This implementation is robust to dicts and dataclasses.
-    """
     if not start_loc:
         return copy.deepcopy(end_loc)
     if not end_loc:
         return copy.deepcopy(start_loc)
 
-    def _point_from(obj):
-        if obj is None:
+    def _point(x: Any):
+        if x is None:
             return None
-        if isinstance(obj, dict):
-            if 'line' in obj or 'column' in obj:
-                return {'line': obj.get('line'), 'column': obj.get('column')}
-            if 'start' in obj and isinstance(obj['start'], dict):
-                return {'line': obj['start'].get('line'), 'column': obj['start'].get('column')}
-            return copy.deepcopy(obj)
-        if dataclasses.is_dataclass(obj):
-            if hasattr(obj, 'end') and getattr(obj, 'end') is not None:
-                return _point_from(getattr(obj, 'end'))
-            if hasattr(obj, 'line') or hasattr(obj, 'column'):
-                return {'line': getattr(obj, 'line', None), 'column': getattr(obj, 'column', None)}
-            if hasattr(obj, 'start'):
-                return _point_from(getattr(obj, 'start'))
-        if hasattr(obj, 'line') or hasattr(obj, 'column'):
-            return {'line': getattr(obj, 'line', None), 'column': getattr(obj, 'column', None)}
-        if hasattr(obj, 'end'):
-            return _point_from(getattr(obj, 'end'))
-        return copy.deepcopy(obj)
+        if isinstance(x, dict):
+            if "line" in x or "column" in x:
+                return {"line": x.get("line"), "column": x.get("column")}
+            if "start" in x and isinstance(x["start"], dict):
+                return x["start"].copy()
+            return copy.deepcopy(x)
+        if dataclasses.is_dataclass(x):
+            if hasattr(x, "line") or hasattr(x, "column"):
+                return {"line": getattr(x, "line", None), "column": getattr(x, "column", None)}
+        if hasattr(x, "line") or hasattr(x, "column"):
+            return {"line": getattr(x, "line", None), "column": getattr(x, "column", None)}
+        return copy.deepcopy(x)
 
-    if isinstance(start_loc, dict):
-        merged = copy.deepcopy(start_loc)
-        if isinstance(end_loc, dict):
-            if 'end' in end_loc:
-                merged['end'] = copy.deepcopy(end_loc['end'])
-            elif 'line' in end_loc or 'column' in end_loc:
-                merged['end'] = {'line': end_loc.get('line'), 'column': end_loc.get('column')}
-            else:
-                merged['end'] = _point_from(end_loc)
-        else:
-            merged['end'] = _point_from(end_loc)
-        return merged
-
-    if dataclasses.is_dataclass(start_loc):
-        end_candidate = None
-        if isinstance(end_loc, dict) and 'end' in end_loc:
-            end_candidate = end_loc['end']
-        elif dataclasses.is_dataclass(end_loc) and hasattr(end_loc, 'end'):
-            end_candidate = getattr(end_loc, 'end')
-        else:
-            end_candidate = _point_from(end_loc)
-
-        try:
-            if hasattr(start_loc, 'end'):
-                return dataclasses.replace(start_loc, end=end_candidate)
-            potential = {}
-            for name in ('line_end', 'col_end', 'column_end', 'end_line', 'end_column', 'offset_end'):
-                if hasattr(start_loc, name):
-                    val = getattr(end_loc, name, None) if hasattr(end_loc, name) else None
-                    if val is None:
-                        pt = _point_from(end_loc)
-                        if isinstance(pt, dict) and 'line' in pt and 'column' in pt:
-                            if name in ('line_end', 'end_line'):
-                                val = pt.get('line')
-                            elif name in ('col_end', 'column_end', 'end_column'):
-                                val = pt.get('column')
-                    if val is not None:
-                        potential[name] = val
-            if potential:
-                return dataclasses.replace(start_loc, **potential)
-        except Exception:
-            pass
-        return start_loc
-
-    try:
-        start_pt = _point_from(start_loc)
-        end_pt = _point_from(end_loc)
-        return {'start': start_pt, 'end': end_pt}
-    except Exception:
-        return copy.deepcopy(start_loc)
+    return {"start": _point(start_loc), "end": _point(end_loc)}
 
 
-# -------------------------
-# Core partitioning logic
-# -------------------------
-def _flatten_section_labelgroups(section: Section) -> List[Tuple[str, Any]]:
-    """
-    Flatten the ordered sequence of LabelGroup children in a section into
-    a linear stream of items: tuples of ('label', Label) or ('instr', Instruction).
-    """
-    linear: List[Tuple[str, Any]] = []
-    for child in section.children:
+# ====================== LINEARIZATION ======================
+
+def _flatten_section(section: Section) -> List[Tuple[str, Any]]:
+    out: List[Tuple[str, Any]] = []
+    for child in getattr(section, "children", []) or []:
         if isinstance(child, LabelGroup):
-            for it in child.instructions:
+            for it in getattr(child, "instructions", []) or []:
                 if isinstance(it, Label):
-                    linear.append(('label', it))
+                    out.append(("label", it))
                 elif isinstance(it, Instruction):
-                    linear.append(('instr', it))
+                    out.append(("instr", it))
                 else:
-                    linear.append(('other', it))
+                    out.append(("other", it))
         else:
-            # Preserve existing Function nodes or other types
-            linear.append(('function-node', child))
-    return linear
+            out.append(("function-node", child))
+    return out
 
 
-def _identify_function_entry_labels(
-    linear_stream: List[Tuple[str, Any]],
-    program_globals: List[str],
-    program_sections: Optional[Iterable[Section]] = None
-) -> Dict[str, bool]:
-    """
-    Heuristic: function entry labels come from:
-      - program globals (explicit)
-      - call targets found anywhere in executable sections
-      - label references embedded ONLY in data sections (.init_array/.rodata/.fini_array etc)
+# ====================== ENTRY IDENTIFICATION ======================
 
-    Targets of jumps (conditional and unconditional) are explicitly excluded from
-    creating a function boundary, as they are treated exclusively as basic block leaders.
-
-    Returns a dict mapping label_name -> is_boundary.
-    """
-    globals_set = set(program_globals or [])
-
+def _scan_program_for_targets(program: Program) -> Tuple[Set[str], Set[str], Set[str]]:
     call_targets: Set[str] = set()
     jump_targets: Set[str] = set()
-    data_references: Set[str] = set()
-    init_fini_references: Set[str] = set()
+    init_fini_refs: Set[str] = set()
 
-    if program_sections is not None:
-        init_fini_sections = {'.init_array', '.fini_array', '.preinit_array'}
-        for sec in program_sections:
-            if _is_executable_section(sec):
-                # Scan executable sections for call and jump targets everywhere
-                for child in getattr(sec, 'children', []) or []:
-                    if isinstance(child, LabelGroup):
-                        for it in getattr(child, 'instructions', []) or []:
+    for sec in getattr(program, "sections", []) or []:
+        if _is_executable_section(sec):
+            for child in getattr(sec, "children", []) or []:
+                if isinstance(child, LabelGroup):
+                    for it in getattr(child, "instructions", []) or []:
+                        if isinstance(it, Instruction):
+                            op = _opcode(it.opcode)
+                            if _is_call(op):
+                                call_targets |= _collect_operand_label_names(it)
+                            elif _is_any_jumpish(op):
+                                jump_targets |= _collect_operand_label_names(it)
+                elif isinstance(child, Function):
+                    for bb in getattr(child, "basic_blocks", []) or []:
+                        for it in getattr(bb, "instructions", []) or []:
                             if isinstance(it, Instruction):
-                                op = _opcode_family(it.opcode)
+                                op = _opcode(it.opcode)
                                 if _is_call(op):
-                                    call_targets.update(_collect_operand_label_names(it))
-                                elif _is_branch(op) or _is_loop(op):
-                                    jump_targets.update(_collect_operand_label_names(it))
-                    elif isinstance(child, Function):
-                        for bb in getattr(child, 'basic_blocks', []) or []:
-                            for it in getattr(bb, 'instructions', []) or []:
-                                if isinstance(it, Instruction):
-                                    op = _opcode_family(it.opcode)
-                                    if _is_call(op):
-                                        call_targets.update(_collect_operand_label_names(it))
-                                    elif _is_branch(op) or _is_loop(op):
-                                        jump_targets.update(_collect_operand_label_names(it))
-            else:
-                # Conservative scan of pure DATA sections avoids bleeding jump/exec operands
-                # into the data references set.
-                for child in getattr(sec, 'children', []) or []:
-                    _extract_label_names_from_obj(child, data_references)
-                for item in getattr(sec, 'pseudo_instruct', []) or []:
-                    _extract_label_names_from_obj(item, data_references)
+                                    call_targets |= _collect_operand_label_names(it)
+                                elif _is_any_jumpish(op):
+                                    jump_targets |= _collect_operand_label_names(it)
+        elif sec.name in INIT_FINI_SECTIONS:
+            for child in getattr(sec, "children", []) or []:
+                _extract_label_names_from_obj(child, init_fini_refs)
+            for item in getattr(sec, "pseudo_instruct", []) or []:
+                _extract_label_names_from_obj(item, init_fini_refs)
 
-                # Special boundary classification for init/fini arrays
-                if sec.name in init_fini_sections:
-                    for child in getattr(sec, 'children', []) or []:
-                        _extract_label_names_from_obj(child, init_fini_references)
-                    for item in getattr(sec, 'pseudo_instruct', []) or []:
-                        _extract_label_names_from_obj(item, init_fini_references)
+    return call_targets, jump_targets, init_fini_refs
 
-    # Backup: Always scan the local linear stream in case there are missing sections/parents
-    for kind, node in linear_stream:
-        if kind == 'instr' and isinstance(node, Instruction):
-            op = _opcode_family(node.opcode)
-            if _is_call(op):
-                call_targets.update(_collect_operand_label_names(node))
-            elif _is_branch(op) or _is_loop(op):
-                jump_targets.update(_collect_operand_label_names(node))
 
-    label_names_in_stream: Set[str] = {
-        node.name for kind, node in linear_stream if kind == 'label' and isinstance(node, Label)
+def _identify_entry_candidates(
+    linear_stream: List[Tuple[str, Any]],
+    program: Program,
+) -> Tuple[Set[str], Dict[str, bool]]:
+    labels_in_stream: Set[str] = {
+        node.name for kind, node in linear_stream
+        if kind == "label" and isinstance(node, Label) and isinstance(getattr(node, "name", None), str)
     }
 
-    # Initial function boundary candidates
-    candidates = (globals_set | call_targets | data_references) & label_names_in_stream
+    globals_set = set(getattr(program, "globals", []) or [])
+    call_targets, jump_targets, init_fini_refs = _scan_program_for_targets(program)
 
-    # Exclude direct jump targets so they strictly serve as basic block leaders inside functions,
-    # NOT function boundaries. We protect definitive globals/array-exports or targets genuinely `call`ed.
-    pure_jump_targets = jump_targets - (globals_set | init_fini_references | call_targets)
-    candidates = candidates - pure_jump_targets
+    def is_likely_local_label(name: str) -> bool:
+        """Local assembler labels (starting with . or L) are never function entries."""
+        return name.startswith('.') or name.startswith('L')
 
-    # Determine boundary status
-    boundary_candidates = (globals_set | init_fini_references | {'main', '_start'}) & candidates
+    # Base candidates: globals, call targets, and init/fini references.
+    base_candidates = (globals_set | call_targets | init_fini_refs) & labels_in_stream
 
-    return {name: (name in boundary_candidates) for name in candidates}
+    # --- Span-aware promotion of jump-only targets ---
+    # A non-local jump target is promoted to a function entry ONLY when it
+    # falls OUTSIDE the linear span [entry … next_entry) of every base-function
+    # that branches to it.  Targets that sit inside the jumping function's span
+    # are internal control-flow labels (e.g. error_exit, do_exit in _start),
+    # not separate functions.  Targets outside (e.g. report_error, located
+    # before main but jumped to from main) become separate function entries.
+    potential_external = {
+        t for t in jump_targets
+        if not is_likely_local_label(t)
+        and t in labels_in_stream
+        and t not in base_candidates
+    }
+
+    if potential_external:
+        # Map every label to its index in the linear stream
+        label_positions: Dict[str, int] = {}
+        for i, (kind, node) in enumerate(linear_stream):
+            if kind == "label" and isinstance(node, Label):
+                label_positions[node.name] = i
+
+        # Sorted stream-positions of base function entries
+        sorted_base_positions = sorted(
+            label_positions[name]
+            for name in base_candidates
+            if name in label_positions
+        )
+
+        def _span_end(entry_pos: int) -> int:
+            """Position of the next base entry after *entry_pos*, or stream end."""
+            for pos in sorted_base_positions:
+                if pos > entry_pos:
+                    return pos
+            return len(linear_stream)
+
+        def _owning_base_entry(stream_pos: int) -> Optional[int]:
+            """Base entry position whose span covers *stream_pos*."""
+            owner = None
+            for ep in sorted_base_positions:
+                if ep <= stream_pos:
+                    owner = ep
+                else:
+                    break
+            return owner
+
+        # Collect every jump instruction that targets a potential-external label
+        jump_info: List[Tuple[int, Set[str]]] = []
+        for i, (kind, node) in enumerate(linear_stream):
+            if kind == "instr" and isinstance(node, Instruction):
+                if _is_any_jumpish(_opcode(node.opcode)):
+                    hits = _collect_operand_label_names(node) & potential_external
+                    if hits:
+                        jump_info.append((i, hits))
+
+        promoted: Set[str] = set()
+        for target_name in potential_external:
+            target_pos = label_positions.get(target_name)
+            if target_pos is None:
+                continue
+
+            # A target is "internal" if it sits inside the span of at least
+            # one base-function that branches to it.
+            is_internal = False
+            for jump_pos, targets in jump_info:
+                if target_name not in targets:
+                    continue
+                owner_pos = _owning_base_entry(jump_pos)
+                if owner_pos is not None:
+                    if owner_pos <= target_pos < _span_end(owner_pos):
+                        is_internal = True
+                        break
+
+            if not is_internal:
+                promoted.add(target_name)
+
+        base_candidates |= promoted
+
+    candidates = base_candidates
+    boundary_set = (globals_set | init_fini_refs | {"main", "_start"}) & candidates
+    boundary_map = {name: (name in boundary_set) for name in candidates}
+
+    return candidates, boundary_map
 
 
-def _split_linear_stream_into_function_segments(
-    linear_stream: List[Tuple[str, Any]],
-    entry_label_candidates: Set[str]
+# ====================== SEGMENTATION + BACKWARD REPAIR ======================
+
+def _split_into_segments(
+    linear_stream: List[Tuple[str, Any]], entry_candidates: Set[str]
 ) -> List[List[Tuple[str, Any]]]:
-    """
-    Split the flattened linear stream into function segments based on entry label candidates.
-    """
     segments: List[List[Tuple[str, Any]]] = []
     cur: List[Tuple[str, Any]] = []
 
-    def flush_current():
+    def flush():
         nonlocal cur
         if cur:
             segments.append(cur)
             cur = []
 
-    for idx, (kind, node) in enumerate(linear_stream):
-        if kind == 'function-node':
-            flush_current()
+    for kind, node in linear_stream:
+        if kind == "function-node":
+            flush()
             segments.append([(kind, node)])
             continue
-
-        if kind == 'label' and isinstance(node, Label) and node.name in entry_label_candidates:
-            flush_current()
+        if kind == "label" and isinstance(node, Label) and node.name in entry_candidates:
+            flush()
             cur = [(kind, node)]
         else:
-            if not cur:
-                cur.append((kind, node))
-            else:
+            if cur or kind == "label":   # start collecting once we see first label
                 cur.append((kind, node))
 
-    flush_current()
+    flush()
     return segments
 
 
-def _partition_segment_into_function(segment: List[Tuple[str, Any]], program_globals: List[str], bb_id_counter: itertools.count, entry_boundary_map: Dict[str, bool]) -> Optional[Function]:
-    """
-    Partition a function segment into BasicBlocks and return a Function.
-    """
+def _repair_backward_jump_ownership(
+    segments: List[List[Tuple[str, Any]]],
+    linear_stream: List[Tuple[str, Any]],
+    entry_candidates: Set[str],
+) -> List[List[Tuple[str, Any]]]:
+    """Core fix for frame_dummy/L1130_1 style thunks."""
+    if not segments:
+        return segments
+
+    label_pos = {node.name: i for i, (kind, node) in enumerate(linear_stream)
+                 if kind == "label" and isinstance(node, Label)}
+
+    # 1. Determine ownership of backward targets
+    owner: Dict[str, str] = {}
+    current_owner: Optional[str] = None
+
+    for i, (kind, node) in enumerate(linear_stream):
+        if kind == "label" and isinstance(node, Label) and node.name in entry_candidates:
+            current_owner = node.name
+
+        if kind == "instr" and isinstance(node, Instruction) and current_owner:
+            if _is_any_jumpish(_opcode(node.opcode)):
+                for t in _collect_operand_label_names(node):
+                    if t in label_pos and label_pos[t] < i and t not in entry_candidates:
+                        owner[t] = current_owner
+
+    # 2. Map entry -> segment index
+    entry_to_seg: Dict[str, int] = {}
+    for si, seg in enumerate(segments):
+        for kind, node in seg:
+            if kind == "label" and isinstance(node, Label) and node.name in entry_candidates:
+                entry_to_seg[node.name] = si
+                break
+
+    # 3. Move chunks (including connected internal labels)
+    for si in range(len(segments)):
+        seg = segments[si]
+        keep: List[Tuple[str, Any]] = []
+        moves: List[Tuple[int, List[Tuple[str, Any]]]] = []
+
+        j = 0
+        while j < len(seg):
+            kind, node = seg[j]
+            if kind == "label" and isinstance(node, Label):
+                lbl = node.name
+                if lbl in owner and lbl not in entry_candidates:
+                    dest_entry = owner[lbl]
+                    dest_si = entry_to_seg.get(dest_entry)
+                    if dest_si is not None and dest_si > si:
+                        # Collect connected component (labels reachable by internal jumps/fallthrough)
+                        chunk_start = j
+                        k = j + 1
+                        while k < len(seg):
+                            ck, cn = seg[k]
+                            if ck == "label" and isinstance(cn, Label):
+                                if cn.name in entry_candidates:
+                                    break
+                                # reachable by jump from current chunk?
+                                reachable = any(
+                                    cn.name in _collect_operand_label_names(it)
+                                    for _, it in seg[chunk_start:k] if isinstance(it, Instruction)
+                                )
+                                if not reachable and _is_ret(_opcode(getattr(seg[k-1][1], "opcode", "")) if k > 0 else False):
+                                    break
+                                k += 1
+                                continue
+                            k += 1
+                        chunk = seg[chunk_start:k]
+                        moves.append((dest_si, chunk))
+                        j = k
+                        continue
+            keep.append((kind, node))
+            j += 1
+
+        segments[si] = keep
+        for dest_si, chunk in moves:
+            # Prepend so entry stays at the logical front
+            segments[dest_si] = chunk + segments[dest_si]
+
+    return segments
+
+
+# ====================== BB PARTITIONING ======================
+
+def _partition_segment_to_function(
+    segment: List[Tuple[str, Any]],
+    bb_id_counter: itertools.count,
+    entry_candidates: Set[str],
+    boundary_map: Dict[str, bool],
+    program_globals: List[str],
+) -> Optional[Function]:
     if not segment:
         return None
-
-    if len(segment) == 1 and segment[0][0] == 'function-node':
+    if len(segment) == 1 and segment[0][0] == "function-node":
         node = segment[0][1]
         return node if isinstance(node, Function) else None
 
     instrs: List[Instruction] = []
-    label_to_inst_index: Dict[str, int] = {}
-    label_name_to_labelobj: Dict[str, Label] = {}
+    label_to_idx: Dict[str, int] = {}
+    label_obj: Dict[str, Label] = {}
 
-    for item_kind, item in segment:
-        if item_kind == 'label' and isinstance(item, Label):
-            label_to_inst_index[item.name] = len(instrs)
-            label_name_to_labelobj[item.name] = item
-        elif item_kind == 'instr' and isinstance(item, Instruction):
-            instrs.append(item)
+    for kind, node in segment:
+        if kind == "label" and isinstance(node, Label):
+            label_to_idx[node.name] = len(instrs)
+            label_obj[node.name] = node
+        elif kind == "instr" and isinstance(node, Instruction):
+            instrs.append(node)
 
-    if not instrs:
+    if not instrs and not label_to_idx:
         return None
 
-    # Determine entry label
+    # Entry label selection - prefer externally visible symbol
     entry_label: Optional[str] = None
-    labels_at_zero = [name for name, idx in label_to_inst_index.items() if idx == 0]
-    if labels_at_zero:
-        entry_label = labels_at_zero[0]
-    else:
-        for name in program_globals or []:
-            if name in label_to_inst_index:
+    for name, idx in label_to_idx.items():
+        if idx == 0 and name in entry_candidates:
+            entry_label = name
+            break
+    if not entry_label:
+        for name in label_to_idx:
+            if name in entry_candidates:
                 entry_label = name
                 break
+    if not entry_label:
+        zeros = [n for n, idx in label_to_idx.items() if idx == 0]
+        entry_label = zeros[0] if zeros else None
+    if not entry_label:
+        for g in program_globals:
+            if g in label_to_idx:
+                entry_label = g
+                break
 
-    # Leader-based partitioning
+    # Leaders
     leaders: Set[int] = {0}
-    for name, idx in label_to_inst_index.items():
+    for nm, idx in label_to_idx.items():
         if 0 <= idx < len(instrs):
             leaders.add(idx)
 
-    for i, instr in enumerate(instrs):
-        op = _opcode_family(instr.opcode)
-        referenced_labels = _collect_operand_label_names(instr)
-        for lbl in referenced_labels:
-            tgt_idx = label_to_inst_index.get(lbl)
-            if tgt_idx is not None:
-                leaders.add(tgt_idx)
+    for i, ins in enumerate(instrs):
+        op = _opcode(ins.opcode)
+        for t in _collect_operand_label_names(ins):
+            if t in label_to_idx:
+                leaders.add(label_to_idx[t])
+        if _is_cond_jmp(op) or _is_loop(op):
+            if i + 1 < len(instrs):
+                leaders.add(i + 1)
 
-        if _is_return(op) or _is_unconditional_jump(op):
+    sorted_leaders = sorted(x for x in leaders if 0 <= x < len(instrs))
+
+    labels_by_idx: Dict[int, List[Label]] = {}
+    for nm, idx in label_to_idx.items():
+        labels_by_idx.setdefault(idx, []).append(label_obj[nm])
+
+    bbs: List[BasicBlock] = []
+    for li, start in enumerate(sorted_leaders):
+        end = sorted_leaders[li + 1] if li + 1 < len(sorted_leaders) else len(instrs)
+        block_instrs = instrs[start:end]
+        if not block_instrs:
             continue
 
-        if _is_branch(op) or _is_loop(op):
-            next_idx = i + 1
-            if next_idx < len(instrs):
-                leaders.add(next_idx)
-
-    sorted_leaders = sorted([l for l in leaders if 0 <= l < len(instrs)])
-    basic_blocks: List[BasicBlock] = []
-
-    labels_by_index: Dict[int, List[Label]] = {}
-    for name, idx in label_to_inst_index.items():
-        if 0 <= idx <= len(instrs):
-            labels_by_index.setdefault(idx, []).append(label_name_to_labelobj[name])
-
-    for li, start_idx in enumerate(sorted_leaders):
-        end_idx = sorted_leaders[li + 1] if (li + 1) < len(sorted_leaders) else len(instrs)
-        block_insts = instrs[start_idx:end_idx]
-
-        if not block_insts:
-            continue
-
-        bb = BasicBlock(instructions=block_insts)
+        bb = BasicBlock(instructions=block_instrs)
         bb.id = f"bb_{next(bb_id_counter)}"
 
-        # Attach start label (prefer first one at this index)
-        label_list = labels_by_index.get(start_idx)
-        if label_list:
-            bb.start_label = label_list[0]
+        lbls = labels_by_idx.get(start, [])
+        if lbls:
+            bb.start_label = lbls[0]
 
-        # --- Source Location Calculation for BasicBlock ---
-        loc_start = None
-        if label_list and getattr(label_list[0], 'location', None):
-            loc_start = label_list[0].location
-        elif block_insts and getattr(block_insts[0], 'location', None):
-            loc_start = block_insts[0].location
-
-        loc_end = None
-        if block_insts and getattr(block_insts[-1], 'location', None):
-            loc_end = block_insts[-1].location
-
+        loc_start = getattr(lbls[0], "location", None) if lbls else getattr(block_instrs[0], "location", None)
+        loc_end = getattr(block_instrs[-1], "location", None)
         if loc_start and loc_end:
             bb.location = _merge_source_locations(loc_start, loc_end)
         elif loc_start:
             bb.location = loc_start
-        # --------------------------------------------------
 
-        basic_blocks.append(bb)
+        bbs.append(bb)
 
-    func = Function(basic_blocks=basic_blocks)
+    fn = Function(basic_blocks=bbs)
     if entry_label:
-        func.entry_label = entry_label
-        func.is_boundary = entry_boundary_map.get(entry_label, False)
+        fn.entry_label = entry_label
+        fn.is_boundary = boundary_map.get(entry_label, False)
 
-    # --- Source Location Calculation for Function ---
-    if basic_blocks:
-        func_start = getattr(basic_blocks[0], 'location', None)
-        func_end = getattr(basic_blocks[-1], 'location', None)
+    if bbs:
+        s = getattr(bbs[0], "location", None)
+        e = getattr(bbs[-1], "location", None)
+        if s and e:
+            fn.location = _merge_source_locations(s, e)
+        elif s:
+            fn.location = s
 
-        if func_start and func_end:
-            func.location = _merge_source_locations(func_start, func_end)
-        elif func_start:
-            func.location = func_start
-    # ------------------------------------------------
+    return fn
 
-    return func
 
+# ====================== MAIN ======================
 
 def partition_program_into_functions_and_basic_blocks(program: Program) -> Program:
-    """
-    Main entry: mutate `program` in-place (and also return it) performing Step 3.
-    """
     bb_id_counter = itertools.count()
-    for sec in program.sections:
+
+    for sec in getattr(program, "sections", []) or []:
         if not _is_executable_section(sec):
             continue
 
-        linear_stream = _flatten_section_labelgroups(sec)
-        entry_boundary_map = _identify_function_entry_labels(linear_stream, program.globals or [], program.sections)
-        entry_candidates = set(entry_boundary_map.keys())
-        segments = _split_linear_stream_into_function_segments(linear_stream, entry_candidates)
+        linear = _flatten_section(sec)
+        entry_candidates, boundary_map = _identify_entry_candidates(linear, program)
 
-        if not segments and linear_stream:
-            segments = [linear_stream]
+        segments = _split_into_segments(linear, entry_candidates)
+        segments = _repair_backward_jump_ownership(segments, linear, entry_candidates)
+
+        if not segments and linear:
+            segments = [linear]
 
         new_children: List[Any] = []
         for seg in segments:
-            func = _partition_segment_into_function(seg, program.globals or [], bb_id_counter, entry_boundary_map)
-            if func is not None:
-                new_children.append(func)
+            fn = _partition_segment_to_function(
+                seg,
+                bb_id_counter=bb_id_counter,
+                entry_candidates=entry_candidates,
+                boundary_map=boundary_map,
+                program_globals=getattr(program, "globals", []) or [],
+            )
+            if fn is not None:
+                new_children.append(fn)
             else:
-                # Fallback: preserve labels/instrs as LabelGroup if Function creation failed
-                from astNodes import LabelGroup as LG
-                lg = LG()
+                lg = LabelGroup(instructions=[])
                 for kind, node in seg:
-                    if kind == 'label' and isinstance(node, Label):
-                        lg.instructions.append(node)
-                    elif kind == 'instr' and isinstance(node, Instruction):
+                    if kind in ("label", "instr"):
                         lg.instructions.append(node)
                 if lg.instructions:
                     new_children.append(lg)
@@ -559,57 +582,33 @@ def partition_program_into_functions_and_basic_blocks(program: Program) -> Progr
     return program
 
 
-# -------------------------
-# Optional convenience API
-# -------------------------
-def partition_and_serialize(program: Program) -> Dict[str, Any]:
+def partition_and_serialize(program: Program, include_instr_locations: bool = False) -> Dict[str, Any]:
     partition_program_into_functions_and_basic_blocks(program)
-    from astNodes import ast_to_legacy_program_dict
-    return ast_to_legacy_program_dict(program)
+    return ast_to_legacy_program_dict(program, include_instr_locations=include_instr_locations)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import sys
     import json
     import argparse
 
-    def eprint(*args, **kwargs):
-        print(*args, file=sys.stderr, **kwargs)
-
-    parser = argparse.ArgumentParser(
-        description="Partition typed AST into Functions and BasicBlocks and output legacy JSON."
-    )
-    # The user asked for flag name "-iloc". We support that and a more explicit long form.
-    parser.add_argument(
-        '-iloc',
-        '--include-instr-locations',
-        action='store_true',
-        help='Include per-instruction source locations in the output JSON (verbose).'
-    )
+    parser = argparse.ArgumentParser(description="Partition typed AST into Functions & BasicBlocks.")
+    parser.add_argument("-iloc", "--include-instr-locations", action="store_true",
+                        help="Include per-instruction source locations")
     args = parser.parse_args()
 
+    raw = sys.stdin.read()
+    if not raw:
+        print("No input on stdin.", file=sys.stderr)
+        sys.exit(2)
+
     try:
-        raw = sys.stdin.read()
-        if not raw:
-            eprint("No input on stdin. Expecting JSON legacy program dict.")
-            sys.exit(2)
-
         obj = json.loads(raw)
-        program = legacy_program_dict_to_ast(obj)
-        # Partition in-place
-        partition_program_into_functions_and_basic_blocks(program)
-
-        # Serialize with the requested verbosity
-        out_dict = ast_to_legacy_program_dict(program, include_instr_locations=args.include_instr_locations)
-        json.dump(out_dict, sys.stdout, indent=2)
+        prog = legacy_program_dict_to_ast(obj)
+        partition_program_into_functions_and_basic_blocks(prog)
+        out = ast_to_legacy_program_dict(prog, include_instr_locations=args.include_instr_locations)
+        json.dump(out, sys.stdout, indent=2)
         sys.stdout.write("\n")
-
-    except json.JSONDecodeError as jde:
-        eprint("Failed to parse JSON from stdin:", jde)
-        sys.exit(3)
-    except ValueError as ve:
-        eprint("Input validation error:", ve)
-        sys.exit(4)
-    except Exception as exc:
-        eprint("Unexpected error while partitioning AST:", repr(exc))
+    except Exception as e:
+        print(f"Error: {e!r}", file=sys.stderr)
         sys.exit(1)
