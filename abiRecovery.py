@@ -3,6 +3,7 @@ Step 7: Intraprocedural ABI Recovery (Arguments, Return Type, Stack Layout)
 Builds on the enriched AST from previous steps. For each function:
 - Distinguishes boundary functions (external ABI) from internal functions (usage-based).
 - For boundary functions: enforces standard signatures (main, constructors, destructors).
+- Explicitly handles `_start` to preserve the physical initial machine state (like RDX for rtld_fini).
 - For all functions: recovers register/stack arguments, return type, and stack layout.
 - Tracks ABI compliance including alignment violations before variadic calls.
 - Annotates the Function node and updates the SymbolTable with recovered signatures.
@@ -276,8 +277,8 @@ class AbiRecoverer:
 
         # ----- Infer return type (internal view) -----
         has_rax_write = "RAX" in defined_regs
-        
-        # Respect pure noreturn routines locally, unless it's main 
+
+        # Respect pure noreturn routines locally, unless it's main
         if func.noreturn_kind and func.entry_label != "main":
             internal_return_type = "void"
         else:
@@ -291,6 +292,11 @@ class AbiRecoverer:
                 # Enforce standard main signature implicitly overriding to standard int return
                 external_abi_signature = STANDARD_MAIN_SIGNATURE
                 internal_return_type = "i32"
+            elif entry_label == "_start":
+                # ELF entry point: kernel passes rtld_fini in RDX (3rd register slot).
+                # Signature must span at least 3 arguments so the wrapper captures RDX.
+                external_abi_signature = "void (i64, i64, i64)"
+                internal_return_type = "void"
             elif entry_label in ("constructor_stub", "destructor_stub") or entry_label.endswith("_stub"):
                 external_abi_signature = STANDARD_CTOR_DTOR_SIGNATURE
                 internal_return_type = "void"
@@ -307,9 +313,6 @@ class AbiRecoverer:
                 abi_compliance = "partial"
         else:
             if has_call and not has_rsp_adjustment:
-                # Exactly the case the review describes:
-                # No frame pointer, has outgoing calls, no stack adjustment
-                # → RSP ≡ 8 (mod 16) at every CALL site → partial
                 abi_compliance = "partial"
             elif len(stack_slots) > 0 or has_stack_args or has_rsp_adjustment:
                 abi_compliance = "custom"
@@ -334,24 +337,33 @@ class AbiRecoverer:
             if func.is_boundary and external_abi_signature:
                 sym["llvm_type"] = external_abi_signature
             else:
-                arg_types = []
-                for ad in arguments:
-                    typ = ad.inferred_type or "i64"
-                    if ad.kind == "float":
-                        typ = "double"
-                    arg_types.append(typ)
-                args_str = ", ".join(arg_types) if arg_types else ""
-                ret = internal_return_type or "void"
-                sym["llvm_type"] = f"{ret} ({args_str})" if args_str else f"{ret} ()"
+                sym["llvm_type"] = self._build_signature(internal_return_type or "void", arguments)
 
     def _build_signature(self, return_type: str, arguments: List[ArgumentDescriptor]) -> str:
-        """Build LLVM signature string from return type and arguments."""
-        arg_types = []
+        """Build LLVM signature string from return type and arguments.
+        Pads missing positional register arguments with placeholders (e.g., i64)
+        to ensure proper LLVM-to-physical register mappings.
+        """
+        max_reg_idx = -1
+        for ad in arguments:
+            if ad.kind == "register" and ad.index is not None:
+                max_reg_idx = max(max_reg_idx, ad.index)
+
+        arg_types = ["i64"] * (max_reg_idx + 1)
+        stack_args = []
+
         for ad in arguments:
             typ = ad.inferred_type or "i64"
             if ad.kind == "float":
                 typ = "double"
-            arg_types.append(typ)
+
+            if ad.kind == "register" and ad.index is not None:
+                arg_types[ad.index] = typ
+            else:
+                stack_args.append(typ)
+
+        arg_types.extend(stack_args)
+
         args_str = ", ".join(arg_types) if arg_types else ""
         return f"{return_type} ({args_str})" if args_str else f"{return_type} ()"
 
