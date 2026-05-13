@@ -25,6 +25,8 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <unordered_set>
+
 #include <google/protobuf/util/json_util.h>
 
 #include "ast.pb.h"
@@ -430,6 +432,19 @@ static void synthesizeBoundaryWrapperBody(LLVMContext& ctx,
   B.CreateRet(UndefValue::get(retTy));
 }
 
+// GNU runtime optional hooks that should always have weak linkage.
+// These symbols may legitimately be unresolved at link time.
+static const std::unordered_set<std::string> kKnownWeakSymbols = {
+    "_ITM_deregisterTMCloneTable",
+    "_ITM_registerTMCloneTable",
+    "__gmon_start__",
+    "__cxa_finalize"
+};
+
+static bool isKnownWeakSymbol(const std::string& name) {
+    return kKnownWeakSymbols.count(name) > 0;
+}
+
 int main(int argc, char** argv) {
   bool printMode = false;
   std::vector<std::string> positionalArgs;
@@ -493,15 +508,25 @@ int main(int argc, char** argv) {
     const std::string kind = entry.has_kind() ? entry.kind() : "";
 
     if (kind == "function") {
-      if (entry.has_is_external() && entry.is_external()) {
-        FunctionType* ft = parseFunctionType(ctx, entry.llvm_type());
-        auto* f = Function::Create(ft, GlobalValue::ExternalLinkage, name, M.get());
+        if (entry.has_is_external() && entry.is_external()) {
+            FunctionType* ft = parseFunctionType(ctx, entry.llvm_type());
 
-        if (name == "exit") f->addFnAttr(Attribute::NoReturn);
+            // Determine linkage: known optional runtime hooks get weak linkage
+            GlobalValue::LinkageTypes linkage = GlobalValue::ExternalLinkage;
+            if (isKnownWeakSymbol(name)) {
+                linkage = GlobalValue::ExternalWeakLinkage;
+            }
 
-        symMap[name] = f;
-      }
-      continue;
+            auto* f = Function::Create(ft, linkage, name, M.get());
+
+            // Apply known function attributes
+            if (name == "exit") {
+                f->addFnAttr(Attribute::NoReturn);
+            }
+
+            symMap[name] = f;
+        }
+        continue;
     }
 
     if (kind == "data" || kind == "constant") {
