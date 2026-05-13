@@ -1,5 +1,5 @@
 """
-extractAST.py – Step 2 transformer that consumes a parse-tree
+extractAST.py – Implementation of Step 2 transformer that consumes a parse-tree
 (dictionary-shaped, as produced by an ANTLR JSON exporter or similar)
 and builds a typed AST using dataclasses from astNodes.py.
 
@@ -164,21 +164,23 @@ class RipRelativeDetector:
     def _extract_from_expression(self, expr_data: Any) -> Optional[object]:
         if not isinstance(expr_data, dict):
             return None
-        # Check for 'wrt' key
+
+        # Check for 'wrt' key - return structured dict instead of string
         if 'wrt' in expr_data:
             wrt_expr = expr_data['wrt']
-            if isinstance(wrt_expr, list) and len(wrt_expr) >= 3:
-                # Extract the symbol and the wrt target
-                symbol_part = wrt_expr[0]
-                wrt_target_part = wrt_expr[2]
-                symbol = self.navigator.normalize_token(symbol_part)
-                wrt_target = self.navigator.normalize_token(wrt_target_part)
-                return f"{symbol} wrt {wrt_target}"
+            if isinstance(wrt_expr, list) and len(wrt_expr) >= 1:
+                symbol = self.navigator.normalize_token(wrt_expr[0])
+                wrt_target = None
+                if len(wrt_expr) >= 3:
+                    wrt_target = self.navigator.normalize_token(wrt_expr[2])
+                return {'name': symbol, 'wrt': wrt_target}
+            return None
+
         # Continue with existing logic for other cases
-        for key in ('additiveExpression', 'multiplicativeExpression', 'castExpression', 'unaryExpression'):
+        for key in ('additiveExpression', 'multiplicativeExpression',
+                    'castExpression', 'unaryExpression'):
             if key in expr_data and expr_data[key]:
                 elem = expr_data[key][0]
-                # recurse
                 if isinstance(elem, dict):
                     if 'name' in elem:
                         return self.navigator.normalize_token(elem['name'])
@@ -186,11 +188,11 @@ class RipRelativeDetector:
                         int_item = elem['integer'][0]
                         if isinstance(int_item, (list, tuple)) and int_item:
                             return int_item[0]
-                    # deeper recursion
                     res = self._extract_from_expression(elem)
                     if res is not None:
                         return res
-        # fallback to top-level name/integer
+
+        # Fallback to top-level name/integer
         if 'name' in expr_data:
             return self.navigator.normalize_token(expr_data['name'])
         if 'integer' in expr_data:
@@ -253,11 +255,17 @@ class ExpressionVisitor:
         return None
 
     def _visit_wrt(self, wrt_expr: List[Any]) -> Any:
+        """
+        Parse a 'wrt' expression and preserve both the symbol name and wrt target.
+        Input: typically [symbol_token, 'wrt', target_token] e.g., ['printf', 'wrt', '..plt']
+        Output: {'name': 'printf', 'wrt': '..plt'}
+        """
         if isinstance(wrt_expr, list) and len(wrt_expr) >= 1:
-            # We just want the base symbol to align with standard operand definitions
-            symbol_part = wrt_expr[0]
-            symbol = self.navigator.normalize_token(symbol_part)
-            return {'name_from_wrt': symbol}
+            symbol = self.navigator.normalize_token(wrt_expr[0])
+            wrt_target = None
+            if len(wrt_expr) >= 3:
+                wrt_target = self.navigator.normalize_token(wrt_expr[2])
+            return {'name': symbol, 'wrt': wrt_target}
         return None
 
     def _visit_cast(self, cast_expr: List[Any]) -> Any:
@@ -729,19 +737,31 @@ class AsmTransformer(ParseTreeVisitor):
             elif 'size' in item:
                 op.size = self.navigator.normalize_token(item['size']).upper()
             elif 'expression' in item:
-                # Evaluate expression; if it reduces to a plain integer immediate,
-                # store it in op.integer for consistency with direct 'integer' operands.
+                # Evaluate expression; handle various result shapes
                 expr_res = self._process_expression(item)
-                if isinstance(expr_res, dict) and 'integer' in expr_res and len(expr_res) == 1:
-                    int_rec = expr_res['integer']
-                    # propagate ascii if present in the expression result
-                    op.integer = Immediate(value=int_rec['value'],
-                                        type=int_rec['type'],
-                                        ascii=int_rec.get('ascii'))
-                elif isinstance(expr_res, dict) and 'name_from_wrt' in expr_res and len(expr_res) == 1:
-                    op.name = expr_res['name_from_wrt']
+
+                if isinstance(expr_res, dict):
+                    # Case 1: Simple integer from expression
+                    if 'integer' in expr_res and len(expr_res) == 1:
+                        int_rec = expr_res['integer']
+                        op.integer = Immediate(
+                            value=int_rec['value'],
+                            type=int_rec['type'],
+                            ascii=int_rec.get('ascii')
+                        )
+                    # Case 2: wrt expression (new format with both name and wrt)
+                    elif 'name' in expr_res:
+                        op.name = expr_res['name']
+                        if expr_res.get('wrt'):
+                            op.wrt = expr_res['wrt']
+                    # Case 3: Legacy wrt format (backward compatibility)
+                    elif 'name_from_wrt' in expr_res:
+                        op.name = expr_res['name_from_wrt']
+                    # Case 4: Other complex expression
+                    else:
+                        op.expression = expr_res
                 else:
-                    # Non-trivial expression: keep as expression field
+                    # Non-dict expression result (string, etc.)
                     op.expression = expr_res
             elif 'integer' in item:
                 imm_node = self.registry.transform('integer', item['integer'])

@@ -258,6 +258,8 @@ class Operand(ASTNode):
 
     address_refinement: Optional[str] = None  # e.g., 'ptr'; only for memory operands (address components)
 
+    wrt: Optional[str] = None   # wrt qualifier target (e.g., '..plt', '..got', or None).
+
 
 @dataclass
 class Memory(ASTNode):
@@ -445,12 +447,16 @@ def _serialize_operand(op: Operand, include_enhancements: bool = False) -> Dict[
         if op.memory.displacement is not None:
             mem['displacement'] = op.memory.displacement
         out['memory'] = mem
+    if op.wrt is not None:
+        out['wrt'] = op.wrt
     if include_enhancements:
         if op.symbol_ref:
             out['symbol_ref'] = op.symbol_ref.name
         out['rip_relative'] = op.rip_relative
         # expose via_got explicitly (bool)
         out['via_got'] = getattr(op, 'via_got', False)
+        #if op.value_refinement is not None:
+        #    out['value_refinement'] = op.value_refinement  # serialized as 'pointee_refinement' equivalent for memory
         if op.address_refinement is not None:
             out['address_refinement'] = op.address_refinement
     return out
@@ -705,11 +711,14 @@ def _deserialize_operand(op_dict: Dict[str, Any], include_enhancements: bool = F
         if 'displacement' in mem_dict:
             mem.displacement = mem_dict['displacement']
         op.memory = mem
+    if 'wrt' in op_dict:
+        op.wrt = op_dict['wrt']
     if include_enhancements:
         if 'symbol_ref' in op_dict:
             op._temp_symbol_ref = op_dict['symbol_ref']
         op.rip_relative = op_dict.get('rip_relative', False)
         op.via_got = op_dict.get('via_got', False)
+        #op.value_refinement = op_dict.get('value_refinement')
         op.address_refinement = op_dict.get('address_refinement')
     return op
 
