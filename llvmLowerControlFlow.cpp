@@ -360,6 +360,25 @@ static void processFunction(FnLowerCtx &LC) {
             else if (opc == "SYSCALL") lowerSyscall(LC, CI, *astIt->second);
         }
     }
+
+    // Ensure the entry block is first in the function to satisfy LLVM's requirement
+    // that the entry block cannot have predecessors
+    if (LC.FnAst->has_entry_label()) {
+    std::string entryLabel = LC.FnAst->entry_label();
+    for (const auto &bbAst : LC.FnAst->basic_blocks()) {
+        if (bbAst.has_start_label() && bbAst.start_label() == entryLabel) {
+        if (LC.bbIdToLlvm.count(bbAst.id())) {
+            BasicBlock *entryBB = LC.bbIdToLlvm[bbAst.id()];
+            // Move the entry block to the beginning if it's not already there
+            if (entryBB != &LC.F->getEntryBlock()) {
+            entryBB->moveBefore(&LC.F->getEntryBlock());
+            }
+        }
+        break;
+        }
+    }
+    }
+
     for (const auto &bbAst : LC.FnAst->basic_blocks()) {
         if (!bbAst.has_id() || !LC.bbIdToLlvm.count(bbAst.id())) continue;
         BasicBlock *BB = LC.bbIdToLlvm[bbAst.id()];
