@@ -22,7 +22,6 @@ from astNodes import (
     ArgumentDescriptor,
     StackSlot,
 )
-
 # ---------------------------------------------------------------------------
 # Constants & Helpers
 # ---------------------------------------------------------------------------
@@ -39,7 +38,6 @@ SIZE_MAP = {
 STANDARD_MAIN_SIGNATURE = "i32 (i32, ptr, ptr)"
 STANDARD_CTOR_DTOR_SIGNATURE = "void ()"
 VARIADIC_FUNCTIONS = {"printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf"}
-
 def _get_base_reg(reg: str) -> str:
     """Normalize a register to its 64-bit base to avoid aliasing false-positives."""
     reg = reg.upper()
@@ -62,7 +60,6 @@ def _get_base_reg(reg: str) -> str:
         "R15B": "R15", "R15W": "R15", "R15D": "R15", "R15": "R15",
     }
     return base_map.get(reg, reg)
-
 def _is_zero_idiom(instr: Instruction) -> bool:
     """Identify patterns like XOR RAX, RAX which only define/zero, not read."""
     if instr.opcode in ("XOR", "SUB") and len(instr.operands) == 2:
@@ -70,22 +67,17 @@ def _is_zero_idiom(instr: Instruction) -> bool:
         if op0.register and op1.register and op0.register == op1.register:
             return True
     return False
-
 def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
     writes: Set[str] = set()
     reads: Set[str] = set()
-
     def add_write(r):
         if r: writes.add(_get_base_reg(r))
-
     def add_read(r):
         if r: reads.add(_get_base_reg(r))
-
     # Catch pure zero-idiom assignments early
     if _is_zero_idiom(instr):
         add_write(instr.operands[0].register)
         return writes, reads
-
     if instr.operands:
         dest_op = instr.operands[0]
         if dest_op.register:
@@ -93,7 +85,6 @@ def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
         if dest_op.memory:
             add_read(dest_op.memory.base)
             add_read(dest_op.memory.index)
-
     READS_FIRST_OPERAND = {
         "ADD", "ADC", "SUB", "SBB", "AND", "OR", "XOR", "TEST", "CMP",
         "SHL", "SAL", "SAR", "SHR", "ROL", "ROR", "RCL", "RCR", "SHLD", "SHRD",
@@ -105,7 +96,6 @@ def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
         "XCHG", "XADD", "CMPXCHG"
     }
     reads_first = instr.opcode in READS_FIRST_OPERAND
-
     for i, op in enumerate(instr.operands):
         if op.register:
             if i == 0 and not reads_first:
@@ -114,14 +104,12 @@ def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
         if op.memory:
             add_read(op.memory.base)
             add_read(op.memory.index)
-
     if instr.opcode == "PUSH":
         add_write("RSP")
     if instr.opcode == "POP":
         add_read("RSP")
         if instr.operands and instr.operands[0].register:
             add_write(instr.operands[0].register)
-
     # Implicit architecture operations
     if instr.opcode in ("DIV", "IDIV", "MUL"):
         add_read("RAX"); add_read("RDX")
@@ -134,9 +122,7 @@ def _get_writes_reads(instr: Instruction) -> Tuple[Set[str], Set[str]]:
         if instr.opcode in ("CDQ", "CQO", "CWD"):
             add_write("RDX")
         add_write("RAX")
-
     return writes, reads
-
 def _is_variadic_call(instr: Instruction) -> bool:
     """Check if instruction is a call to a variadic function."""
     if instr.opcode != "CALL":
@@ -145,24 +131,20 @@ def _is_variadic_call(instr: Instruction) -> bool:
         if op.name in VARIADIC_FUNCTIONS:
             return True
     return False
-
 class AbiRecoverer:
     def __init__(self, program: Program):
         self.program = program
         self.symbol_table = program.symbol_table
-
     def run(self):
         """Process all functions, distinguishing boundary from internal."""
         for section in self.program.sections:
             for child in section.children:
                 if isinstance(child, Function) and child.entry_label:
                     self._analyze_function(child)
-
     def _analyze_function(self, func: Function):
         if not func.basic_blocks:
             return
         entry_bb = func.basic_blocks[0]
-
         # ----- Frame pointer / prolog detection -----
         uses_fp = False
         if len(entry_bb.instructions) >= 2:
@@ -173,15 +155,13 @@ class AbiRecoverer:
                 i1.operands[1].register == "RSP"):
                 uses_fp = True
         func.uses_frame_pointer = uses_fp
-
         # ----- Collect memory accesses and register early-use info -----
         mem_accesses: List[Tuple[int, Operand, Instruction]] = []
         defined_regs: Set[str] = set()
         early_int_arg_regs: Set[str] = set()
         has_alignment_violation = False
         has_call = False
-        has_rsp_adjustment = False   # NEW - detects any stack realignment
-
+        has_rsp_adjustment = False # NEW - detects any stack realignment
         for bb in func.basic_blocks:
             for instr in bb.instructions:
                 writes, reads = _get_writes_reads(instr)
@@ -189,21 +169,18 @@ class AbiRecoverer:
                     if reg in GP_ARG_REGS and reg not in defined_regs:
                         early_int_arg_regs.add(reg)
                 defined_regs.update(writes)
-
                 for op in instr.operands:
                     if op.memory and op.memory.base:
                         base_reg = _get_base_reg(op.memory.base)
-                        if base_reg in ("RBP", "RSP") and isinstance(op.memory.displacement, int):
+                        if base_reg == "RBP" and isinstance(op.memory.displacement, int):
                             mem_accesses.append((op.memory.displacement, op, instr))
-
                 # ABI tracking (NEW)
                 if instr.opcode == "CALL":
                     has_call = True
                     if _is_variadic_call(instr) and uses_fp:
                         has_alignment_violation = True
-                if "RSP" in writes:          # catches PUSH, POP, SUB RSP, ADD RSP, etc.
+                if "RSP" in writes: # catches PUSH, POP, SUB RSP, ADD RSP, etc.
                     has_rsp_adjustment = True
-
         # ----- Recover register arguments -----
         arguments: List[ArgumentDescriptor] = []
         for idx, reg in enumerate(GP_ARG_REGS):
@@ -217,7 +194,6 @@ class AbiRecoverer:
                         first_use=None,
                     )
                 )
-
         # ----- Recover stack-passed arguments -----
         if uses_fp:
             positive_offsets = {disp for disp, _, _ in mem_accesses if disp > 8}
@@ -238,7 +214,6 @@ class AbiRecoverer:
                     expected_off += 8
                 else:
                     break
-
         # ----- Recover local stack slots + Saved RBP -----
         stack_slots: List[StackSlot] = []
         if uses_fp:
@@ -257,7 +232,7 @@ class AbiRecoverer:
             # Locals (negative displacements)
             offset_to_sizes = defaultdict(set)
             for disp, op, _ in mem_accesses:
-                if disp < 0:
+                if disp != 0 and not (disp > 8):  # not saved-RBP and not a stack-passed argument
                     size = SIZE_MAP.get(op.size, 8)
                     offset_to_sizes[disp].add(size)
             for i, off in enumerate(sorted(offset_to_sizes.keys())):
@@ -274,39 +249,36 @@ class AbiRecoverer:
                         index=i + 1,
                     )
                 )
-
         # ----- Infer return type (internal view) -----
         has_rax_write = "RAX" in defined_regs
-
         # Respect pure noreturn routines locally, unless it's main
         if func.noreturn_kind and func.entry_label != "main":
             internal_return_type = "void"
         else:
             internal_return_type = "i64" if has_rax_write else "void"
-
         # ----- Boundary Function: Enforce Standard External Signature -----
+        # (external view only; internal usage view is always preserved)
         external_abi_signature: Optional[str] = None
         if func.is_boundary:
             entry_label = func.entry_label or ""
             if entry_label == "main":
-                # Enforce standard main signature implicitly overriding to standard int return
+                # Enforce standard main signature (wrapper-facing ABI)
+                # Internal usage-derived return/arguments remain unchanged
                 external_abi_signature = STANDARD_MAIN_SIGNATURE
-                internal_return_type = "i32"
             elif entry_label == "_start":
                 # ELF entry point: kernel passes rtld_fini in RDX (3rd register slot).
                 # Signature must span at least 3 arguments so the wrapper captures RDX.
+                # Internal usage-derived return/arguments remain unchanged
                 external_abi_signature = "void (i64, i64, i64)"
-                internal_return_type = "void"
             elif entry_label in ("constructor_stub", "destructor_stub") or entry_label.endswith("_stub"):
+                # Zero-argument, void-return external signature for stubs
+                # Internal usage-derived return/arguments remain unchanged
                 external_abi_signature = STANDARD_CTOR_DTOR_SIGNATURE
-                internal_return_type = "void"
-                arguments = []
             else:
+                # Fallback to usage-based recovery for other boundary functions
                 external_abi_signature = self._build_signature(internal_return_type, arguments)
-
         # ----- Set ABI compliance grade -----
         has_stack_args = any(a.kind == "stack" for a in arguments)
-
         if uses_fp:
             abi_compliance = "standard"
             if has_alignment_violation:
@@ -317,20 +289,17 @@ class AbiRecoverer:
             elif len(stack_slots) > 0 or has_stack_args or has_rsp_adjustment:
                 abi_compliance = "custom"
             else:
-                abi_compliance = "full"  # true leaves/stubs
-
+                abi_compliance = "full" # true leaves/stubs
         # Override for main: the crude variadic+fp flag produces a false “partial”.
         # push rbp already gives 16-byte alignment; main is standard ABI.
         if func.entry_label == "main" and abi_compliance == "partial":
             abi_compliance = "standard"
-
         # ----- Annotate function -----
         func.arguments = arguments
         func.stack_slots = stack_slots
         func.return_type = internal_return_type
         func.abi_compliance = abi_compliance
         func.external_abi_signature = external_abi_signature
-
         # ----- Update symbol table with recovered signature -----
         if func.entry_label in self.symbol_table:
             sym = self.symbol_table[func.entry_label]
@@ -338,7 +307,6 @@ class AbiRecoverer:
                 sym["llvm_type"] = external_abi_signature
             else:
                 sym["llvm_type"] = self._build_signature(internal_return_type or "void", arguments)
-
     def _build_signature(self, return_type: str, arguments: List[ArgumentDescriptor]) -> str:
         """Build LLVM signature string from return type and arguments.
         Pads missing positional register arguments with placeholders (e.g., i64)
@@ -348,26 +316,19 @@ class AbiRecoverer:
         for ad in arguments:
             if ad.kind == "register" and ad.index is not None:
                 max_reg_idx = max(max_reg_idx, ad.index)
-
         arg_types = ["i64"] * (max_reg_idx + 1)
         stack_args = []
-
         for ad in arguments:
             typ = ad.inferred_type or "i64"
             if ad.kind == "float":
                 typ = "double"
-
             if ad.kind == "register" and ad.index is not None:
                 arg_types[ad.index] = typ
             else:
                 stack_args.append(typ)
-
         arg_types.extend(stack_args)
-
         args_str = ", ".join(arg_types) if arg_types else ""
         return f"{return_type} ({args_str})" if args_str else f"{return_type} ()"
-
-
 # ---------------------------------------------------------------------------
 # Main Entry Point
 # ---------------------------------------------------------------------------
@@ -393,6 +354,5 @@ def main():
         import traceback
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
-
 if __name__ == "__main__":
     main()
