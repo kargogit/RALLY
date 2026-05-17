@@ -320,7 +320,7 @@ static void lowerSETcc(FnLowerCtx& LC, IRBuilder<>& B, const lifted_ast::Instruc
 
   Value* cond = nullptr;
   if (opcUpper == "SETC" || opcUpper == "SETB") cond = loadFlag(LC, B, CF);
-  else if (opcUpper == "SETNE") cond = B.CreateNot(loadFlag(LC, B, ZF), "setne");
+  else if (opcUpper == "SETNE" || opcUpper == "SETNZ") cond = B.CreateNot(loadFlag(LC, B, ZF), "setnz");
   else if (opcUpper == "SETE" || opcUpper == "SETZ") cond = loadFlag(LC, B, ZF);
   else if (opcUpper == "SETPE" || opcUpper == "SETP") cond = loadFlag(LC, B, PF);
   else cond = B.getFalse();
@@ -549,6 +549,54 @@ static void lowerXCHG(FnLowerCtx& LC, IRBuilder<>& B, const lifted_ast::Instruct
   recordMapping(LC, insn, oldMem);
 }
 
+static void lowerXADD(FnLowerCtx& LC, IRBuilder<>& B, const lifted_ast::Instruction& insn) {
+  if (insn.operands_size() < 2) return;
+  const auto& dst = insn.operands(0);
+  const auto& src = insn.operands(1);
+
+  // Determine operand width from dst
+  Type* ty = nullptr;
+  if (dst.has_register_()) {
+    unsigned w = regWidthBits(dst.register_());
+    ty = intTy(LC.C, w == 0 ? 64 : w);
+  } else if (dst.has_memory()) {
+    unsigned sz = memSizeBytesFromOperand(dst);
+    ty = sz == 0 ? chooseOpIntType(LC, insn) : intTy(LC.C, sz * 8);
+  } else return;
+  if (!ty || !ty->isIntegerTy()) ty = B.getInt64Ty();
+
+  // Load destination (old value)
+  Value* oldDst = nullptr;
+  if (dst.has_register_()) {
+    oldDst = truncOrZext(B, readGprSubreg(LC, B, decodeReg(dst.register_())), ty);
+  } else if (dst.has_memory()) {
+    oldDst = loadFromMem(LC, B, dst, ty, insn.id());
+  } else return;
+
+  // Load source value
+  Value* srcVal = resolveRValue(LC, B, src, ty, insn.id());
+
+  // Perform add
+  Value* sum = B.CreateAdd(oldDst, srcVal, "xadd.sum");
+  updateFlagsAdd(LC, B, oldDst, srcVal, sum);
+
+  // Store sum back to destination
+  if (dst.has_register_()) {
+    writeGprSubreg(LC, B, decodeReg(dst.register_()), sum);
+  } else if (dst.has_memory()) {
+    storeToMem(LC, B, dst, sum, ty, insn.id());
+  }
+
+  // Write old destination value into source register
+  // (XADD semantics: src <- old dst)
+  if (src.has_register_()) {
+    writeGprSubreg(LC, B, decodeReg(src.register_()), oldDst);
+  }
+  // Note: if src is memory, behavior is undefined per x86 (src must be reg)
+
+  recordMapping(LC, insn, sum);
+}
+
 static void lowerPOP(FnLowerCtx& LC, IRBuilder<>& B, const lifted_ast::Instruction& insn) {
   if (insn.operands_size() < 1) return;
   const auto& dst = insn.operands(0);
@@ -682,6 +730,57 @@ static void lowerCDQE(FnLowerCtx& LC, IRBuilder<>& B, const lifted_ast::Instruct
     Value* result = B.CreateSExt(eaxVal, B.getInt64Ty(), "cdqe");
     writeGprSubreg(LC, B, rax, result);
     recordMapping(LC, insn, result);
+}
+
+static void lowerBSF_BSR(FnLowerCtx& LC, IRBuilder<>& B, const lifted_ast::Instruction& insn, bool isForward) {
+  if (insn.operands_size() < 2) return;
+  const auto& dst = insn.operands(0);
+  const auto& src = insn.operands(1);
+
+  if (!dst.has_register_()) return;
+  RegInfo dri = decodeReg(dst.register_());
+  if (!dri.isValid || dri.isXmm) return;
+
+  Type* ty = intTy(LC.C, dri.bitWidth);
+  Value* srcVal = resolveRValue(LC, B, src, ty, insn.id());
+  if (!srcVal) return;
+
+  // Get the appropriate count-leading/trailing zeros intrinsic
+  Intrinsic::ID intrinID = isForward ? Intrinsic::cttz : Intrinsic::ctlz;
+  Function* ctz = Intrinsic::getDeclaration(&LC.M, intrinID, {ty});
+
+  // is_zero_undef = false (we want defined behavior when src == 0)
+  Value* isZeroUndef = B.getFalse();
+  Value* count = B.CreateCall(ctz, {srcVal, isZeroUndef}, isForward ? "bsf.cttz" : "bsr.ctlz");
+
+  // For BSR we need: (width - 1) - ctlz(src)
+  Value* result = count;
+  if (!isForward) {
+    Value* widthMinusOne = ConstantInt::get(ty, dri.bitWidth - 1);
+    result = B.CreateSub(widthMinusOne, count, "bsr.adjust");
+  }
+
+  // ZF = (src == 0)
+  Value* isZero = B.CreateICmpEQ(srcVal, ConstantInt::get(ty, 0), "bsf.zf");
+  storeFlag(LC, B, ZF, isZero);
+
+  // Other arithmetic flags are undefined
+  Type* i1Ty = Type::getInt1Ty(LC.C);
+  Value* undefFlag = UndefValue::get(i1Ty);
+  storeFlag(LC, B, CF, undefFlag);
+  storeFlag(LC, B, OF, undefFlag);
+  storeFlag(LC, B, SF, undefFlag);
+  storeFlag(LC, B, AF, undefFlag);
+  storeFlag(LC, B, PF, undefFlag);
+
+  // Destination: leave undefined when src == 0 (per x86 spec)
+  // Use select to keep old value or write new result
+  Value* oldDst = readGprSubreg(LC, B, dri);
+  Value* oldDstExt = truncOrZext(B, oldDst, ty);
+  Value* finalVal = B.CreateSelect(isZero, oldDstExt, result, "bsf.dst");
+
+  writeGprSubreg(LC, B, dri, finalVal);
+  recordMapping(LC, insn, finalVal);
 }
 
 static void lowerDIV(FnLowerCtx& LC, IRBuilder<>& B, const lifted_ast::Instruction& insn) {
@@ -831,19 +930,22 @@ static void lowerFunction(FnLowerCtx& LC) {
       else if (opc == "TEST") lowerTEST(LC, B, insn);
       else if (opc == "MOVZX") lowerMOVZX_MOVSX(LC, B, insn, false);
       else if (opc == "MOVSX") lowerMOVZX_MOVSX(LC, B, insn, true);
-      else if (opc == "SETC" || opc == "SETB" || opc == "SETNE" || opc == "SETPE" || opc == "SETP" || opc == "SETE" || opc == "SETZ") lowerSETcc(LC, B, insn, opc);
+      else if (opc == "SETC" || opc == "SETB" || opc == "SETNE" || opc == "SETNZ" || opc == "SETPE" || opc == "SETP" || opc == "SETE" || opc == "SETZ") lowerSETcc(LC, B, insn, opc);
       else if (opc == "CMOVE") lowerCMOVE(LC, B, insn);
       else if (opc == "INC") lowerINC(LC, B, insn);
       else if (opc == "SHL") lowerSHL(LC, B, insn);
       else if (opc == "SHR") lowerSHR(LC, B, insn);
       else if (opc == "SAR") lowerSAR(LC, B, insn);
       else if (opc == "XCHG") lowerXCHG(LC, B, insn);
+      else if (opc == "XADD") lowerXADD(LC, B, insn);
       else if (opc == "PUSH") lowerPUSH(LC, B, insn);
       else if (opc == "POP") lowerPOP(LC, B, insn);
       else if (opc == "LEAVE") lowerLEAVE(LC, B, insn);
       else if (opc == "IMUL") lowerIMUL(LC, B, insn);
       else if (opc == "CDQ") lowerCDQ(LC, B, insn);
       else if (opc == "CDQE") lowerCDQE(LC, B, insn);
+      else if (opc == "BSF") lowerBSF_BSR(LC, B, insn, true);
+      else if (opc == "BSR") lowerBSF_BSR(LC, B, insn, false);
       else if (opc == "DIV")  lowerDIV(LC, B, insn);
       else if (opc == "IDIV") lowerIDIV_ECX(LC, B, insn);
       else lowerUnsupportedButKeepIR(LC, B, insn);
