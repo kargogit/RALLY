@@ -403,6 +403,25 @@ static void lowerAtomicXADD(FnLowerCtx &LC, const lifted_ast::Instruction &insn,
 static void processFunction(FnLowerCtx &LC) {
   if (!LC.F || LC.F->empty()) return;
 
+  auto instIt = LC.F->getEntryBlock().begin();
+  for (const auto &ss : LC.FnAst->stack_slots()) {
+    while (instIt != LC.F->getEntryBlock().end() && !isa<AllocaInst>(*instIt)) {
+      ++instIt;
+    }
+    if (instIt == LC.F->getEntryBlock().end()) break;
+
+    StackSlotInfo info;
+    info.name = ss.has_name() ? ss.name() : "slot";
+    info.baseReg = ss.has_register_() ? ss.register_() : "RBP";
+    info.startOff = ss.has_offset() ? ss.offset() : 0;
+    info.size = ss.has_size() ? ss.size() : 8;
+    info.align = ss.has_alignment() ? ss.alignment() : 1;
+    info.alloca = cast<AllocaInst>(&*instIt);
+
+    LC.promotedSlots.push_back(info);
+    ++instIt;
+  }
+
   std::map<std::string, const lifted_ast::Instruction*> idToAstInsn;
   for (const auto &bbAst : LC.FnAst->basic_blocks()) {
     for (const auto &ie : bbAst.instructions()) {
