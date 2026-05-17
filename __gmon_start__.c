@@ -1,0 +1,1 @@
+void __gmon_start__ () { return; }
