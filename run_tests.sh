@@ -7,12 +7,13 @@
 ./run_pipeline.sh tests/asm/structuse.asm
 ./run_pipeline.sh tests/asm/linklist.asm
 ./run_pipeline.sh tests/asm/kilo_15.asm
-./run_pipeline.sh tests/asm/fannkuch_18.asm
 ./run_pipeline.sh tests/asm/kill_15.asm
 ./run_pipeline.sh tests/asm/pwd_1.asm
 ./run_pipeline.sh tests/asm/pwd_11.asm
-./run_pipeline.sh tests/asm/fannkuch_19.asm
 ./run_pipeline.sh tests/asm/fannkuch_15.asm
+./run_pipeline.sh tests/asm/fannkuch_18.asm
+./run_pipeline.sh tests/asm/fannkuch_19.asm
+
 
 lli v7_13.ll
 lli v6_13.ll
