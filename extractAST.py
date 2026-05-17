@@ -2,29 +2,24 @@
 extractAST.py – Implementation of Step 2 transformer that consumes a parse-tree
 (dictionary-shaped, as produced by an ANTLR JSON exporter or similar)
 and builds a typed AST using dataclasses from astNodes.py.
-
 Public interface:
     transform(parse_tree: Dict[str, Any]) -> Dict[str, Any]
     (returns the legacy dict format via astNodes.ast_to_legacy_program_dict)
 """
-
 from typing import Any, Dict, List, Optional, Callable, Set
 from abc import ABC
 import json
 import sys
 import copy
-
 # Import typed AST and serializer
 from astNodes import (
     Program, Section, LabelGroup, Instruction, Label, Operand,
     Memory, Immediate, GlobalDecl, ast_to_legacy_program_dict
 )
 
-
 class TranslationError(Exception):
     """Raised when the AST extraction encounters a construct it explicitly does not support."""
     pass
-
 
 # ---------------------------------------------------------------------------
 # Simple token normalization / parse-tree navigation helper
@@ -65,7 +60,6 @@ class ParseTreeNavigator:
                 return ParseTreeNavigator.normalize_token(v)
         return str(token)
 
-
 # ---------------------------------------------------------------------------
 # Generic parse-tree visitor (double-dispatch by key)
 # ---------------------------------------------------------------------------
@@ -83,10 +77,8 @@ class ParseTreeVisitor(ABC):
         context = context or {}
         prev_loc = context.get('current_loc')
         current_loc = node.get('_loc')
-
         if current_loc:
             context['current_loc'] = current_loc
-
         try:
             for key in node:
                 if key == '_loc':
@@ -103,15 +95,8 @@ class ParseTreeVisitor(ABC):
                 elif 'current_loc' in context:
                     del context['current_loc']
 
-        for key in node.keys():
-            method_name = f"visit_{key}"
-            if hasattr(self, method_name):
-                return getattr(self, method_name)(node[key], context)
-        return self.generic_visit(node, context)
-
     def generic_visit(self, node: Any, context: Dict[str, Any]) -> Any:
         return node
-
 
 # ---------------------------------------------------------------------------
 # RIP-relative detection helper
@@ -123,7 +108,6 @@ class RipRelativeDetector:
     This detector is conservative and focuses on extraction of symbolic
     displacements so that RIP-relative addressing is a first-class operand.
     """
-
     def __init__(self, navigator: ParseTreeNavigator):
         self.navigator = navigator
 
@@ -164,7 +148,6 @@ class RipRelativeDetector:
     def _extract_from_expression(self, expr_data: Any) -> Optional[object]:
         if not isinstance(expr_data, dict):
             return None
-
         # Check for 'wrt' key - return structured dict instead of string
         if 'wrt' in expr_data:
             wrt_expr = expr_data['wrt']
@@ -175,7 +158,6 @@ class RipRelativeDetector:
                     wrt_target = self.navigator.normalize_token(wrt_expr[2])
                 return {'name': symbol, 'wrt': wrt_target}
             return None
-
         # Continue with existing logic for other cases
         for key in ('additiveExpression', 'multiplicativeExpression',
                     'castExpression', 'unaryExpression'):
@@ -191,7 +173,6 @@ class RipRelativeDetector:
                     res = self._extract_from_expression(elem)
                     if res is not None:
                         return res
-
         # Fallback to top-level name/integer
         if 'name' in expr_data:
             return self.navigator.normalize_token(expr_data['name'])
@@ -200,7 +181,6 @@ class RipRelativeDetector:
             if isinstance(int_data, (list, tuple)):
                 return int_data[0]
         return None
-
 
 # ---------------------------------------------------------------------------
 # Transformation registry for small reusable handlers
@@ -220,7 +200,6 @@ class TransformationRegistry:
         if handler:
             return handler(data, context or {})
         return None
-
 
 # ---------------------------------------------------------------------------
 # Expression visitor: lightweight expression extraction for immediates, names.
@@ -245,13 +224,11 @@ class ExpressionVisitor:
             return self._visit_multiplicative(actual_expr['multiplicativeExpression'])
         if 'wrt' in actual_expr:
             return self._visit_wrt(actual_expr['wrt'])
-
         # STRICT CHECK: If we are here, the expression contains something we don't know how to handle
         # e.g., 'seg', 'binaryExpression' with unknown ops
         keys = list(actual_expr.keys())
         if keys and keys != ['_loc']:
             raise TranslationError(f"Unsupported expression construct(s): {keys}")
-
         return None
 
     def _visit_wrt(self, wrt_expr: List[Any]) -> Any:
@@ -283,14 +260,12 @@ class ExpressionVisitor:
             return {'integer': int_dict}
         if 'unaryExpression' in expr:
             return self._visit_unary(expr['unaryExpression'])
-
         # Strict check for cast contents
         if isinstance(expr, dict):
             known = {'name', 'register', 'integer', 'unaryExpression', '_loc'}
             unknown = set(expr.keys()) - known
             if unknown:
                 raise TranslationError(f"Unsupported cast expression content: {unknown}")
-
         return None
 
     def _visit_unary(self, unary_expr: List[Any]) -> Any:
@@ -313,11 +288,29 @@ class ExpressionVisitor:
 
     def _visit_additive(self, add_expr: List[Any]) -> Any:
         operands = []
+        pending_op = '+'
         for comp in add_expr:
             if isinstance(comp, dict):
                 if 'multiplicativeExpression' in comp or 'castExpression' in comp:
                     res = self.process({'expression': [comp]})
+                    # Apply pending additive operator to integer sub-operands
+                    if pending_op == '-' and isinstance(res, dict) and 'integer' in res:
+                        try:
+                            v = res['integer']['value']
+                            neg = -int(v, 0) if isinstance(v, str) else -int(v)
+                            res['integer']['value'] = str(neg)
+                        except (ValueError, TypeError):
+                            pass
                     operands.append(res)
+                    pending_op = '+'          # reset after consuming an operand
+            elif isinstance(comp, str) and comp in ('+', '-'):
+                pending_op = comp
+            elif isinstance(comp, (list, tuple)) and comp:
+                tok = self.navigator.normalize_token(comp)
+                if tok in ('+', '-'):
+                    pending_op = tok
+            else:
+                pending_op = '+'              # safe default for unknown shapes
         if not operands:
             return None
         return {'additive': operands} if len(operands) > 1 else operands[0]
@@ -331,7 +324,6 @@ class ExpressionVisitor:
             return None
         return operands if len(operands) > 1 else operands[0]
 
-
 # ---------------------------------------------------------------------------
 # Concrete transformer: builds typed dataclasses and uses serializer for output
 # ---------------------------------------------------------------------------
@@ -343,7 +335,6 @@ class AsmTransformer(ParseTreeVisitor):
         self._setup_handlers()
         # default text section present to preserve legacy behavior
         self.text_section = Section(name='.text')
-
         # --- FIX FOR POINT 4: Equ Registry ---
         # Stores symbol_name -> concrete_value (int) for equ-defined constants
         self.equ_registry: Dict[str, int] = {}
@@ -403,23 +394,18 @@ class AsmTransformer(ParseTreeVisitor):
         """
         if expr is None:
             return None
-
         mem = Memory()
-
         # Symbolic name → RIP-relative (valid under default rel)
         if isinstance(expr, str):
             mem.base = "RIP"
             mem.displacement = expr
             return mem
-
         if not isinstance(expr, dict):
             return None
-
         # Single register
         if "register" in expr and len(expr) == 1:
             mem.base = expr["register"]
             return mem
-
         # Additive expression: expect exactly two parts (reg + disp or disp + reg)
         if "additive" in expr and isinstance(expr["additive"], list) and len(expr["additive"]) == 2:
             addends = expr["additive"]
@@ -429,35 +415,34 @@ class AsmTransformer(ParseTreeVisitor):
                 if isinstance(part, dict):
                     if "register" in part:
                         if reg is not None:
-                            return None  # two registers → too complex, keep as expression
+                            return None # two registers → too complex, keep as expression
                         reg = part["register"]
                     elif "integer" in part:
                         if disp is not None:
                             return None
                         disp_val = part["integer"]["value"]
-                        try:
-                            disp = int(disp_val, 0)  # handles hex if needed
-                        except ValueError:
+                        if isinstance(disp_val, int):
                             disp = disp_val
+                        else:
+                            try:
+                                disp = int(disp_val, 0)  # handles hex / signed strings
+                            except ValueError:
+                                disp = disp_val
             if reg:
                 mem.base = reg
                 if disp is not None:
                     mem.displacement = disp
                 return mem
-
         # Anything else (e.g., reg + reg, scaled index, complex expr) → keep as expression
         return None
-
 
     # Top-level program builder
     def visit_program(self, program_data: List[Any], context: Dict[str, Any]) -> Program:
         # --- FIX FOR POINT 4: Two-Pass Approach ---
         # Pass 1: Collect all equ definitions before building the AST
         self._collect_equ_definitions(program_data)
-
         prog = Program(sections=[self.text_section])
         context['current_section'] = self.text_section
-
         for node in program_data:
             if not isinstance(node, dict):
                 continue
@@ -499,11 +484,9 @@ class AsmTransformer(ParseTreeVisitor):
                     for k in ('integer', 'equ', 'resx'):
                         if k in pseudo and k not in last:
                             last[k] = pseudo[k]
-
                 else:
                     # normal case: a standalone pseudo-instruction with a name (or no previous)
                     ctx_sec.pseudo_instruct.append(pseudo)
-
         return prog
 
     # --- FIX FOR POINT 4: Pass 1 - Collect Equ Definitions ---
@@ -544,7 +527,7 @@ class AsmTransformer(ParseTreeVisitor):
                 name = self.navigator.normalize_token(item['name'])
             elif 'equ' in item:
                 # Next item should contain the value/expression
-                pass  # handled below
+                pass # handled below
             elif 'expression' in item:
                 # Try to evaluate simple integer expressions
                 val = self._evaluate_equ_expression(item['expression'])
@@ -557,7 +540,7 @@ class AsmTransformer(ParseTreeVisitor):
                     try:
                         self.equ_registry[name] = int(imm.value)
                     except (ValueError, TypeError):
-                        pass  # Keep as-is if not convertible
+                        pass # Keep as-is if not convertible
 
     def _evaluate_equ_expression(self, expr_container: Any) -> Optional[int]:
         """
@@ -566,20 +549,17 @@ class AsmTransformer(ParseTreeVisitor):
         """
         if not expr_container or not isinstance(expr_container, list):
             return None
-
         actual = expr_container[0] if expr_container else None
         if not isinstance(actual, dict):
             return None
-
         # Simple integer case
         if 'integer' in actual:
             int_data = actual['integer'][0]
             if isinstance(int_data, (list, tuple)) and int_data:
                 try:
-                    return int(int_data[0], 0)  # handles hex/dec
+                    return int(int_data[0], 0) # handles hex/dec
                 except (ValueError, TypeError):
                     return None
-
         # Additive expression (e.g., 1 + 2)
         if 'additiveExpression' in actual:
             add_expr = actual['additiveExpression']
@@ -588,13 +568,11 @@ class AsmTransformer(ParseTreeVisitor):
                 left = self._evaluate_equ_expression([add_expr[0]])
                 op = add_expr[1] if isinstance(add_expr[1], str) else self.navigator.normalize_token(add_expr[1])
                 right = self._evaluate_equ_expression([add_expr[2]])
-
                 if left is not None and right is not None:
                     if op == '+':
                         return left + right
                     elif op == '-':
                         return left - right
-
         return None
 
     # generic line visitor that handles directive/pseudoinstruction etc.
@@ -606,13 +584,11 @@ class AsmTransformer(ParseTreeVisitor):
             return self._process_directive(line_content['directive'], context)
         if 'pseudoinstruction' in line_content:
             return self._process_pseudoinstruction(line_content['pseudoinstruction'], context)
-
         # Strict Check: If line contains keys we don't recognize
         known_keys = {'directive', 'pseudoinstruction', 'instruction', 'label', '_loc'}
         unknowns = set(line_content.keys()) - known_keys
         if unknowns:
             raise TranslationError(f"Unknown line type: {unknowns}")
-
         return None
 
     def visit_block(self, lgroup_data: List[Any], context: Dict[str, Any]) -> Optional[LabelGroup]:
@@ -639,10 +615,8 @@ class AsmTransformer(ParseTreeVisitor):
                     # otherwise prefer the line wrapper's _loc if present
                     elif isinstance(line_node[0], dict) and '_loc' in line_node[0]:
                         new_loc = line_node[0]['_loc']
-
                     if new_loc is not None:
                         context['current_loc'] = new_loc
-
                     try:
                         instr_node = self.visit_instruction(instr_data, context)
                     finally:
@@ -651,10 +625,8 @@ class AsmTransformer(ParseTreeVisitor):
                             context['current_loc'] = prev_loc
                         elif 'current_loc' in context:
                             del context['current_loc']
-
                     if instr_node:
                         lg.instructions.append(instr_node)
-
             else:
                  # Check for unhandled block items
                 known_keys = {'label', 'non_terminator_line', 'terminator_line', '_loc'}
@@ -662,7 +634,6 @@ class AsmTransformer(ParseTreeVisitor):
                 if unknowns:
                      # This often catches things like 'directive' inside a block where only instructions were expected
                      raise TranslationError(f"Unexpected item in block: {unknowns}")
-
         return lg if lg.instructions else None
 
     def visit_label(self, label_data: List[Any], context: Dict[str, Any]) -> Optional[Label]:
@@ -676,7 +647,6 @@ class AsmTransformer(ParseTreeVisitor):
 
     def visit_instruction(self, instr_data: List[Any], context: Dict[str, Any]) -> Optional[Instruction]:
         instr = Instruction(opcode='')
-
         # If instr_data is a dict wrapper that contains its own _loc, prefer that.
         # Otherwise fall back to context['current_loc'] (set by wrapper nodes).
         explicit_loc = None
@@ -687,7 +657,6 @@ class AsmTransformer(ParseTreeVisitor):
             first = instr_data[0]
             if isinstance(first, dict) and '_loc' in first:
                 explicit_loc = first['_loc']
-
         loc = explicit_loc if explicit_loc is not None else context.get('current_loc')
         if loc:
             # copy so multiple AST nodes don't share the same mutable dict
@@ -709,7 +678,7 @@ class AsmTransformer(ParseTreeVisitor):
                 pass
             else:
                 raise TranslationError(f"Unhandled instruction component: {piece.keys()}")
-    # === Post-process memory operands for actual memory-accessing instructions ===
+        # === Post-process memory operands for actual memory-accessing instructions ===
         if instr.opcode != "LEA":
             for op in instr.operands:
                 if op.expression is not None and op.memory is None:
@@ -718,7 +687,6 @@ class AsmTransformer(ParseTreeVisitor):
                         op.memory = converted
                         op.expression = None
                     # If not converted, leave as expression (safety for unexpected cases)
-
         return instr if instr.opcode else None
 
     def visit_operand(self, operand_data: List[Any], context: Dict[str, Any], current_opcode: str = '') -> Operand:
@@ -727,7 +695,6 @@ class AsmTransformer(ParseTreeVisitor):
         if rip_memory:
             op = Operand(memory=rip_memory)
             return op
-
         op = Operand()
         for item in operand_data:
             if not isinstance(item, dict):
@@ -739,7 +706,6 @@ class AsmTransformer(ParseTreeVisitor):
             elif 'expression' in item:
                 # Evaluate expression; handle various result shapes
                 expr_res = self._process_expression(item)
-
                 if isinstance(expr_res, dict):
                     # Case 1: Simple integer from expression
                     if 'integer' in expr_res and len(expr_res) == 1:
@@ -769,11 +735,9 @@ class AsmTransformer(ParseTreeVisitor):
                     op.integer = imm_node
             elif 'name' in item:
                 symbol_name = self.navigator.normalize_token(item['name'])
-
                 # --- FIX FOR POINT 4: Equ Symbol Folding ---
                 # Check if this symbol is an equ-defined constant
                 equ_value = self._resolve_equ_symbol(symbol_name)
-
                 # Fold to Immediate ONLY if:
                 # 1. It is an equ-defined constant (equ_value is not None)
                 # 2. We are NOT in an address-taking context (LEA)
@@ -795,14 +759,12 @@ class AsmTransformer(ParseTreeVisitor):
                     raise TranslationError(f"Unhandled operand component: {unknowns}")
         return op
 
-
     def _process_directive(self, directive_data: List[Any], context: Dict[str, Any]) -> Optional[object]:
         """
         Robust directive handler.
         """
         if not directive_data:
             return None
-
         # Helper: extract a normalized token from a possibly-nested value
         def _extract_token(val: Any) -> Optional[str]:
             if val is None:
@@ -820,7 +782,6 @@ class AsmTransformer(ParseTreeVisitor):
                     if tok is not None:
                         return tok
             return self.navigator.normalize_token(val)
-
         # Determine directive name
         first = directive_data[0]
         if isinstance(first, dict):
@@ -830,7 +791,6 @@ class AsmTransformer(ParseTreeVisitor):
                 directive_name = self.navigator.normalize_token(first)
         else:
             directive_name = self.navigator.normalize_token(first)
-
         # Special built-in handling
         if directive_name == 'section':
             name = self._extract_section_name(directive_data)
@@ -840,18 +800,15 @@ class AsmTransformer(ParseTreeVisitor):
             if context.get('current_loc'):
                 new_section.location = context['current_loc']
             return new_section
-
         if directive_name == 'global':
             name = self._extract_global_name(directive_data)
             decl = GlobalDecl(name=name)
             if context.get('current_loc'):
                 decl.location = context['current_loc']
             return decl
-
         # === NEW: Special handling for multi-symbol extern ===
         if directive_name == 'extern':
             params: List[str] = []
-
             def collect_names(node: Any) -> None:
                 if isinstance(node, list):
                     for elem in node:
@@ -869,44 +826,36 @@ class AsmTransformer(ParseTreeVisitor):
                             params.append(name)
                     elif 'extern_params' in node:
                         collect_names(node['extern_params'])
-
             # The parameter list is in directive_data[1]['extern_params'] (if present)
             if len(directive_data) >= 2:
                 container = directive_data[1]
                 if isinstance(container, dict) and 'extern_params' in container:
                     collect_names(container['extern_params'])
-
             pseudo = {'directive': 'extern'}
             if params:
                 pseudo['params'] = params
             return {'pseudo_instruct': pseudo}
-
         # === Generic fallback for everything else (default rel, align, etc.) ===
         params: List[str] = []
         seen = set()
-
         def add_param(tok: Optional[str]) -> None:
             if tok is None:
                 return
             if tok not in seen:
                 seen.add(tok)
                 params.append(tok)
-
         # Extract tokens once per item (avoid double-extraction)
         for item in directive_data[1:]:
             tok = _extract_token(item)
             add_param(tok)
-
         # If no params found yet, try pulling from the directive keyword node itself
         if not params and isinstance(first, dict):
             for v in first.values():
                 tok = _extract_token(v)
                 add_param(tok)
-
         pseudo = {'directive': directive_name}
         if params:
             pseudo['params'] = params
-
         return {'pseudo_instruct': pseudo}
 
     def _process_pseudoinstruction(self, pseudo_data: List[Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1023,7 +972,6 @@ class AsmTransformer(ParseTreeVisitor):
         if 'name' in atom:
              # Just normalize the name and treat as a symbol reference
              return {'symbol': self.navigator.normalize_token(atom['name'])}
-
         # If we got here, it's an atom type we don't know (e.g. char constant not in string/int form)
         raise TranslationError(f"Unsupported pseudo-value atom: {atom.keys()}")
 
@@ -1044,7 +992,6 @@ class AsmTransformer(ParseTreeVisitor):
             return self.navigator.normalize_token(params[0].get('name'))
         return ''
 
-
 # ---------------------------------------------------------------------------
 # Public API: transform(parse_tree) -> legacy dict (uses typed AST internally)
 # ---------------------------------------------------------------------------
@@ -1057,7 +1004,6 @@ def transform(parse_tree: Dict[str, Any]) -> Dict[str, Any]:
     program_data = parse_tree.get('program', [])
     ast_root = transformer.visit_program(program_data, {})
     return ast_to_legacy_program_dict(ast_root)
-
 
 # ---------------------------------------------------------------------------
 # CLI driver (JSON in / JSON out)
