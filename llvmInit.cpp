@@ -129,6 +129,7 @@ static Constant* buildInitializer(LLVMContext& ctx, Type* declaredTy, const lift
 }
 
 // Synthesize Boundary Wrapper Body exactly as per Step 10 Point 7.
+// Synthesize Boundary Wrapper Body with CORRECT state initialization
 static void synthesizeBoundaryWrapperBody(LLVMContext& ctx,
                                          StructType* stateTy,
                                          Function* wrapper,
@@ -136,41 +137,77 @@ static void synthesizeBoundaryWrapperBody(LLVMContext& ctx,
                                          bool wrapperNoReturn) {
   BasicBlock* entryBB = BasicBlock::Create(ctx, "entry", wrapper);
   IRBuilder<> B(entryBB);
+  Type* i64Ty = Type::getInt64Ty(ctx);
+  Type* i8Ty = Type::getInt8Ty(ctx);
+  Type* f64Ty = Type::getDoubleTy(ctx);
+  auto* xmmVecTy = FixedVectorType::get(f64Ty, 2);
 
-  // 1. Allocate State with EXACT 64-byte alignment as per spec.
+  // 1. Allocate State with 64-byte alignment
   AllocaInst* state = B.CreateAlloca(stateTy, nullptr, "state");
   state->setAlignment(Align(64));
 
-  // 2. Provide a real host stack for the lifted code (required by spec).
-  ArrayType* stackArrayTy = ArrayType::get(Type::getInt8Ty(ctx), 4096);
-  AllocaInst* hostStack = B.CreateAlloca(stackArrayTy, nullptr, "host_stack");
-  hostStack->setAlignment(Align(16));
+  // 2. CRITICAL FIX: Zero-initialize the entire State to prevent undefined register values
+  const llvm::DataLayout &DL = wrapper->getParent()->getDataLayout();
+  uint64_t stateSize = DL.getTypeAllocSize(stateTy);
 
-  // 3. Compute top address with CreateGEP (stack grows downward).
-  Value* stackTop = B.CreateGEP(
-      stackArrayTy, hostStack,
-      {B.getInt64(0), B.getInt64(4096)},
-      "stack_top",
-      /*inBounds=*/true
+  B.CreateMemSet(state, B.getInt8(0), stateSize, Align(64));
+
+  // 3. Capture the REAL incoming stack pointer using naked inline asm
+  //    This preserves the actual RSP from the native call, not a synthetic stack.
+  //    We read RSP BEFORE any stack operations modify it.
+  FunctionType* getRspFT = FunctionType::get(i64Ty, {}, false);
+  InlineAsm* getRspAsm = InlineAsm::get(
+      getRspFT,
+      "leaq 8(%rsp), $0",  // RSP + 8 (skip return address pushed by call to wrapper)
+      "=r,~{dirflag},~{fpsr},~{flags}",
+      /*hasSideEffects=*/false
   );
-  Value* stackTopI64 = B.CreatePtrToInt(stackTop, Type::getInt64Ty(ctx));
+  Value* realRsp = B.CreateCall(getRspAsm, {}, "real_rsp");
 
-  // 4. Store into %State fields 14 (RSP) and 15 (RBP).
+  // 4. Store real RSP and RBP (initialize RBP to RSP for frame setup)
   Value* rspPtr = B.CreateStructGEP(stateTy, state, 14);
-  B.CreateStore(stackTopI64, rspPtr);
+  B.CreateStore(realRsp, rspPtr);
   Value* rbpPtr = B.CreateStructGEP(stateTy, state, 15);
-  B.CreateStore(stackTopI64, rbpPtr);
+  B.CreateStore(realRsp, rbpPtr);
 
-  // 5. Marshal ABI args (SysV AMD64).
-  const int gprOrder[6] = {
+  // 5. Preserve ALL SysV ABI argument-passing registers, even if not in the function signature.
+  //    This is CRITICAL for _init, _start, and PIC functions where the dynamic linker
+  //    passes state in registers that aren't formal arguments.
+
+  // 5a. Capture integer argument registers (even if wrapper signature is incomplete)
+  const char* intRegNames[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+  const int intRegIndices[6] = {
     gprFieldIndex64("RDI"), gprFieldIndex64("RSI"), gprFieldIndex64("RDX"),
     gprFieldIndex64("RCX"), gprFieldIndex64("R8"),  gprFieldIndex64("R9")
   };
+
+  for (int i = 0; i < 6; ++i) {
+    FunctionType* getRegFT = FunctionType::get(i64Ty, {}, false);
+    std::string asmStr = std::string("movq %") + intRegNames[i] + ", $0";
+    InlineAsm* getRegAsm = InlineAsm::get(
+        getRegFT, asmStr, "=r,~{dirflag},~{fpsr},~{flags}", false
+    );
+    Value* regVal = B.CreateCall(getRegAsm, {}, std::string("preserve_") + intRegNames[i]);
+    Value* regPtr = B.CreateStructGEP(stateTy, state, intRegIndices[i]);
+    B.CreateStore(regVal, regPtr);
+  }
+
+  // 5b. Capture XMM argument registers (even if wrapper signature is incomplete)
+  for (int i = 0; i < 8; ++i) {
+    FunctionType* getXmmFT = FunctionType::get(xmmVecTy, {}, false);
+    std::string asmStr = std::string("movdqa %xmm") + std::to_string(i) + ", $0";
+    InlineAsm* getXmmAsm = InlineAsm::get(
+        getXmmFT, asmStr, "=x,~{dirflag},~{fpsr},~{flags}", false
+    );
+    Value* xmmVal = B.CreateCall(getXmmAsm, {}, std::string("preserve_xmm") + std::to_string(i));
+    Value* xmmPtr = B.CreateStructGEP(stateTy, state, kXmmBase + i);
+    B.CreateStore(xmmVal, xmmPtr);
+  }
+
+  // 6. NOW override with typed arguments from the wrapper signature (if present).
+  //    This ensures proper type conversions (i32→i64 extension, etc.)
   unsigned intReg = 0;
   unsigned fpReg = 0;
-  Type* i64Ty = Type::getInt64Ty(ctx);
-  Type* f64Ty = Type::getDoubleTy(ctx);
-  auto* xmmVecTy = FixedVectorType::get(f64Ty, 2);
 
   for (Argument& arg : wrapper->args()) {
     Type* aTy = arg.getType();
@@ -191,7 +228,7 @@ static void synthesizeBoundaryWrapperBody(LLVMContext& ctx,
       continue;
     }
     if (intReg < 6) {
-      int idx = gprOrder[intReg];
+      int idx = intRegIndices[intReg];
       if (idx >= 0) {
         Value* gprPtr = B.CreateStructGEP(stateTy, state, (unsigned)idx);
         Value* val = nullptr;
@@ -211,11 +248,11 @@ static void synthesizeBoundaryWrapperBody(LLVMContext& ctx,
     intReg++;
   }
 
-  // 6. Call lifted function (explicit bitcast matches spec wording exactly).
+  // 7. Call lifted function
   Value* stateForCall = B.CreateBitCast(state, PointerType::getUnqual(ctx));
   B.CreateCall(liftedF, {stateForCall});
 
-  // 7. Return or Unreachable.
+  // 8. Return handling
   if (wrapperNoReturn) {
     B.CreateUnreachable();
     return;
