@@ -10,6 +10,7 @@ Includes noreturn propagation + CFG pruning of fall-through edges.
 Inputs/Outputs: Enriched AST (JSON via stdin → Protobuf via stdout/file).
 """
 import sys
+import os
 import json
 from typing import Dict, List, Set, Optional, Any
 from collections import defaultdict
@@ -144,21 +145,52 @@ def get_canonical_reg(reg: str) -> Optional[str]:
         'RSP': 'RSP', 'RBP': 'RBP'
     }
     return map_rules.get(r) or (r if r.startswith('XMM') else None)
+
 class ExternalABIDB:
-    KNOWN = {
-        'printf': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None)]},
-        'fprintf': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None), TypeRef(0, False, True, None)]},
-        'scanf': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None)]},
-        'puts': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None)]},
-        'malloc': {'ret': TypeRef(0, False, True, None), 'args': [TypeRef(64, False, False, True)]},
-        'free': {'ret': TypeRef(0, False, False, None), 'args': [TypeRef(0, False, True, None)]},
-        'exit': {'ret': None, 'args': [TypeRef(32, False, False, True)], 'noreturn': True},
-        'abort': {'ret': None, 'args': [], 'noreturn': True},
-        'sqrt': {'ret': TypeRef(64, True, False, None), 'args': [TypeRef(64, True, False, None)]},
-    }
+    KNOWN = {}
+
+    @classmethod
+    def load_from_json(cls):
+        if cls.KNOWN:
+            return
+        try:
+            # Fallback pathing resolves 'externalABI.json' robustly
+            try:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                json_path = os.path.join(base_dir, "externalABI.json")
+            except NameError:
+                json_path = "externalABI.json"
+
+            if not os.path.exists(json_path):
+                json_path = "externalABI.json"
+
+            with open(json_path, "r") as f:
+                data = json.load(f)
+
+            for name, info in data.items():
+                ret_obj = None
+                if info.get('ret') is not None:
+                    r = info['ret']
+                    ret_obj = TypeRef(r.get('width', 0), r.get('is_float', False), r.get('is_ptr', False), r.get('signed'))
+
+                args_obj = []
+                for a in info.get('args', []):
+                    args_obj.append(TypeRef(a.get('width', 0), a.get('is_float', False), a.get('is_ptr', False), a.get('signed')))
+
+                cls.KNOWN[name] = {'ret': ret_obj, 'args': args_obj}
+                if 'noreturn' in info:
+                    cls.KNOWN[name]['noreturn'] = info['noreturn']
+
+        except Exception as e:
+            print(f"Warning: Failed to load externalABI.json: {e}", file=sys.stderr)
+
     @staticmethod
     def get(name: str) -> Optional[Dict]:
         return ExternalABIDB.KNOWN.get(name)
+
+# Initialize dynamically so ExternalABIDB.KNOWN is prepopulated for immediate dictionary usage
+ExternalABIDB.load_from_json()
+
 class CallSite:
     def __init__(self, caller: Function, instr: Instruction, target_name: str, is_external: bool):
         self.caller = caller
