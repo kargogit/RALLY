@@ -10,8 +10,8 @@ Includes noreturn propagation + CFG pruning of fall-through edges.
 Inputs/Outputs: Enriched AST (JSON via stdin → Protobuf via stdout/file).
 """
 import sys
-import os
 import json
+import os
 from typing import Dict, List, Set, Optional, Any
 from collections import defaultdict
 from google.protobuf import text_format
@@ -46,7 +46,7 @@ def ast_to_proto(ast_obj: Program, original_dict: dict) -> pb.Program:
             for s in ast_obj.sections
         ],
         "globals": ast_obj.globals,
-        "symbol_table": original_dict.get("symbol_table", {}),
+        "symbol_table": getattr(ast_obj, 'symbol_table', original_dict.get("symbol_table", {})),
         "id_maps": original_dict.get("id_maps", {})
     }
     proto = pb.Program()
@@ -76,7 +76,6 @@ class TypeRef:
             return TypeRef(32, True, False, None)
         if s in ('f64', 'double'):
             return TypeRef(64, True, False, None)
-
         signed = None
         base = s
         if s.endswith('_signed'):
@@ -85,7 +84,6 @@ class TypeRef:
         elif s.endswith('_unsigned'):
             signed = False
             base = s[:-9]
-
         if base.startswith('i') and base[1:].isdigit():
             return TypeRef(int(base[1:]), False, False, signed)
         return TypeRef.unknown()
@@ -94,13 +92,11 @@ class TypeRef:
             return 'ptr'
         if self.is_float:
             return 'float' if self.width == 32 else 'double'
-
         suffix = ''
         if self.signed is True:
             suffix = '_signed'
         elif self.signed is False:
             suffix = '_unsigned'
-
         return f"i{self.width}{suffix}" if self.width > 0 else 'unknown'
     def is_unknown(self) -> bool:
         return self.width == 0 and not self.is_ptr and not self.is_float and self.signed is None
@@ -110,17 +106,14 @@ def meet(t1: Optional[TypeRef], t2: Optional[TypeRef]) -> TypeRef:
         return t2 or TypeRef.unknown()
     if t2 is None or t2.is_unknown():
         return t1
-
     if t1.is_ptr and t2.is_ptr:
         return TypeRef(64, False, True, None)
     if t1.is_ptr != t2.is_ptr:
         return TypeRef(64, False, True, None) # conservative ptr semantics
-
     if t1.is_float and t2.is_float:
         return t1 if t1.width == t2.width else TypeRef.unknown()
     if t1.is_float != t2.is_float:
         return TypeRef.unknown()
-
     new_width = max(t1.width or 64, t2.width or 64)
     new_signed = t1.signed if t1.signed == t2.signed else None
     return TypeRef(new_width, False, False, new_signed)
@@ -145,52 +138,39 @@ def get_canonical_reg(reg: str) -> Optional[str]:
         'RSP': 'RSP', 'RBP': 'RBP'
     }
     return map_rules.get(r) or (r if r.startswith('XMM') else None)
-
 class ExternalABIDB:
-    KNOWN = {}
+    KNOWN: Optional[Dict[str, Dict]] = None
 
     @classmethod
-    def load_from_json(cls):
-        if cls.KNOWN:
+    def _load_known(cls):
+        """Load ExternalABIDB.KNOWN from externalABI.json (exactly the same data
+        and TypeRef objects as the original hardcoded version)."""
+        if cls.KNOWN is not None:
             return
-        try:
-            # Fallback pathing resolves 'externalABI.json' robustly
-            try:
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                json_path = os.path.join(base_dir, "externalABI.json")
-            except NameError:
-                json_path = "externalABI.json"
-
-            if not os.path.exists(json_path):
-                json_path = "externalABI.json"
-
-            with open(json_path, "r") as f:
-                data = json.load(f)
-
-            for name, info in data.items():
-                ret_obj = None
-                if info.get('ret') is not None:
-                    r = info['ret']
-                    ret_obj = TypeRef(r.get('width', 0), r.get('is_float', False), r.get('is_ptr', False), r.get('signed'))
-
-                args_obj = []
-                for a in info.get('args', []):
-                    args_obj.append(TypeRef(a.get('width', 0), a.get('is_float', False), a.get('is_ptr', False), a.get('signed')))
-
-                cls.KNOWN[name] = {'ret': ret_obj, 'args': args_obj}
-                if 'noreturn' in info:
-                    cls.KNOWN[name]['noreturn'] = info['noreturn']
-
-        except Exception as e:
-            print(f"Warning: Failed to load externalABI.json: {e}", file=sys.stderr)
+        db_path = os.path.join(os.path.dirname(__file__), "externalABI.json")
+        with open(db_path, "r", encoding="utf-8") as f:
+            raw_db = json.load(f)
+        loaded: Dict[str, Dict] = {}
+        for name, raw in raw_db.items():
+            info: Dict[str, Any] = {}
+            ret_raw = raw.get("ret")
+            if ret_raw is None:
+                info["ret"] = None
+            else:
+                info["ret"] = TypeRef.from_string(str(ret_raw))
+            args_raw = raw.get("args", [])
+            info["args"] = [TypeRef.from_string(str(a)) for a in args_raw]
+            info["llvm_type"] = raw.get("llvm_type")
+            if "noreturn" in raw:
+                info["noreturn"] = raw["noreturn"]
+            loaded[name] = info
+        cls.KNOWN = loaded
 
     @staticmethod
     def get(name: str) -> Optional[Dict]:
+        if ExternalABIDB.KNOWN is None:
+            ExternalABIDB._load_known()
         return ExternalABIDB.KNOWN.get(name)
-
-# Initialize dynamically so ExternalABIDB.KNOWN is prepopulated for immediate dictionary usage
-ExternalABIDB.load_from_json()
-
 class CallSite:
     def __init__(self, caller: Function, instr: Instruction, target_name: str, is_external: bool):
         self.caller = caller
@@ -207,6 +187,46 @@ class InterproceduralAnalyzer:
             lambda: {'ret': TypeRef.unknown(), 'args': [TypeRef.unknown() for _ in range(6)]}
         )
         self._collect_functions()
+    def _update_external_symbol_types(self):
+        """Apply ExternalABIDB.KNOWN to the symbol_table, but ONLY for
+        externals that are actually referenced in the program (already in
+        the symbol table or appearing as a call-graph target)."""
+        if not hasattr(self.program, 'symbol_table') or self.program.symbol_table is None:
+            self.program.symbol_table = {}
+        symtab = self.program.symbol_table
+
+        # Collect names that actually appear as call targets in this program
+        referenced_externals: Set[str] = set()
+        for cs in self.call_graph:
+            if cs.is_external:
+                referenced_externals.add(cs.target_name)
+
+        for name, info in ExternalABIDB.KNOWN.items():
+            # ── GATE: skip entirely if this external is never referenced ──
+            if name not in symtab and name not in referenced_externals:
+                continue
+
+            if name not in symtab:
+                # Only create a new entry for a known external that IS
+                # actually called but was missing from the symbol table
+                symtab[name] = {
+                    'name': name,
+                    'kind': 'function',
+                    'visibility': 'global',
+                    'linkage': 'external',
+                    'is_external': True,
+                    'llvm_type': 'void (...)',
+                }
+
+            entry = symtab[name]
+            if (entry.get('kind') == 'function'
+                    and (entry.get('is_external')
+                        or entry.get('linkage') == 'external')):
+                llvm_type = info.get('llvm_type')
+                if llvm_type:
+                    entry['llvm_type'] = llvm_type
+                if info.get('noreturn'):
+                    entry['noreturn'] = True
     def _collect_functions(self):
         for sec in self.program.sections:
             for child in sec.children:
@@ -256,7 +276,6 @@ class InterproceduralAnalyzer:
         bb = cs.instr.parent
         if not bb:
             return TypeRef.unknown()
-
         try:
             call_idx = bb.instructions.index(cs.instr)
         except ValueError:
@@ -268,13 +287,11 @@ class InterproceduralAnalyzer:
                     if prev.op_refinement:
                         t = TypeRef.from_string(prev.op_refinement)
                         return t if not (target_reg.startswith('XMM') and not t.is_float) else TypeRef(64, True, False, None)
-
         return TypeRef.unknown()
     def _find_return_usage_at_call(self, cs: CallSite) -> TypeRef:
         bb = cs.instr.parent
         if not bb:
             return TypeRef.unknown()
-
         try:
             call_idx = bb.instructions.index(cs.instr)
         except ValueError:
@@ -288,15 +305,12 @@ class InterproceduralAnalyzer:
                         if nxt.op_refinement:
                             t = TypeRef.from_string(nxt.op_refinement)
                             return t if not op.register.upper().startswith('XMM') else (t if t.is_float else TypeRef(64, True, False, None))
-
             if nxt.opcode.upper() in ('RET', 'JMP', 'CALL'):
                 break
-
         return TypeRef.unknown()
     def _prune_noreturn_fallthrough(self):
         """Prune spurious fall-through after calls to (newly) noreturn functions."""
         noreturn_targets = {name for name, info in ExternalABIDB.KNOWN.items() if info.get('noreturn')}
-
         for f in self.functions.values():
             if (f.noreturn_kind == 'noreturn' or
                 (f.lifted_signature and 'noreturn' in f.lifted_signature.attributes)):
@@ -315,11 +329,9 @@ class InterproceduralAnalyzer:
         self.build_call_graph()
         worklist = set(self.functions.keys())
         iteration = 0
-
         while worklist and iteration < 30: # safe bound
             iteration += 1
             next_worklist = set()
-
             for f_id in list(worklist):
                 func = self.functions[f_id]
                 changed = False
@@ -331,12 +343,10 @@ class InterproceduralAnalyzer:
                     for i in range(6):
                         passed = self._find_type_passed_at_call(cs, i)
                         new_args[i] = meet(new_args[i], passed)
-
                 if ext_sig and 'args' in ext_sig:
                     for i, at in enumerate(ext_sig['args']):
                         if i < len(new_args):
                             new_args[i] = meet(new_args[i], at)
-
                 if new_args != self.func_constraints[f_id]['args']:
                     self.func_constraints[f_id]['args'] = new_args
                     changed = True
@@ -345,15 +355,12 @@ class InterproceduralAnalyzer:
                 for cs in callers:
                     usage = self._find_return_usage_at_call(cs)
                     new_ret = meet(new_ret, usage)
-
                 if ext_sig:
                     if ext_sig.get('noreturn'):
                         new_ret = TypeRef.unknown()
                     elif ext_sig.get('ret'):
                         new_ret = meet(new_ret, ext_sig['ret'])
-
                 new_ret = meet(new_ret, TypeRef.from_string(func.return_type))
-
                 if new_ret != self.func_constraints[f_id]['ret']:
                     self.func_constraints[f_id]['ret'] = new_ret
                     changed = True
@@ -365,11 +372,12 @@ class InterproceduralAnalyzer:
                     for cs_out in self.call_graph:
                         if cs_out.caller.id == f_id and cs_out.target_name in self.functions:
                             next_worklist.add(cs_out.target_name)
-
             worklist = next_worklist
         self._finalize_signatures()
         self._propagate_refinements()
         self._prune_noreturn_fallthrough()
+        # Make ExternalABIDB.KNOWN affect the symbol table / LLVM IR
+        self._update_external_symbol_types()
     def _refine_external_abi_signature(self, func: Function, refined_ret: str) -> str:
         """Merge interprocedural results into Step 7 external sig while preserving structure."""
         existing = func.external_abi_signature
@@ -425,13 +433,11 @@ class InterproceduralAnalyzer:
                     func, abi_ret_type_str)
 def main():
     args = sys.argv[1:]
-
     # Handle optional --print flag
     print_proto = False
     if "--print" in args:
         print_proto = True
         args.remove("--print")
-
     try:
         raw = sys.stdin.read()
         if not raw.strip():
@@ -441,22 +447,17 @@ def main():
     except Exception as e:
         sys.stderr.write(f"JSON error: {e}\n")
         sys.exit(3)
-
     try:
         # 1. Deserialize via AST nodes
         program = legacy_program_dict_to_ast(obj, include_enhancements=True)
-
         # 2. Perform step 9 refinements directly on the AST
         analyzer = InterproceduralAnalyzer(program)
         analyzer.run()
-
         # 3. Serialize output directly to Protobuf
         proto_msg = ast_to_proto(program, obj)
-
         # Dump human readable format to standard out if requested
         if print_proto:
             print(MessageToJson(proto_msg, indent=2))
-
         # Determine output location (file or stdout)
         out_path = args[0] if len(args) > 0 else None
         if out_path:
@@ -467,7 +468,6 @@ def main():
             # Output directly to stdout buffer to continue the pipeline cleanly (skipping text serialization)
             if not print_proto:
                 sys.stdout.buffer.write(proto_msg.SerializeToString(deterministic=True))
-
     except Exception as e:
         sys.stderr.write(f"Step 9 error: {repr(e)}\n")
         import traceback

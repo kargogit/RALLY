@@ -139,35 +139,28 @@ class SymbolMapper:
         return self.symbol_table[name]
 
     def _extract_externs(self):
-        """Parses .text section for extern declarations and adds known types."""
+        """Parses .text section for extern declarations and adds known types.
+        All function externals now default to 'void (...)' so that Step 9's
+        ExternalABIDB.KNOWN can provide the precise LLVM signature.
+        """
         text_sec = self.section_map.get('.text')
         if not text_sec:
             return
-
         for pseudo in text_sec.pseudo_instruct:
             if isinstance(pseudo, dict) and pseudo.get('directive') == 'extern':
                 params = pseudo.get('params', [])
                 for sym_name in params:
-                    # Upgrade definitions aggressively
                     entry = self._ensure_symbol_entry(sym_name)
                     entry['visibility'] = 'global'
                     entry['linkage'] = 'external'
                     entry['is_external'] = True
-
                     if sym_name == 'stderr':
                         entry['kind'] = 'data'
                         entry['llvm_type'] = 'i8*'
                     else:
+                        # DEFAULT – Step 9 will upgrade known library functions
                         entry['kind'] = 'function'
-                        # Known external types
-                        if sym_name == 'printf':
-                            entry['llvm_type'] = 'i32 (i8*, ...)'
-                        elif sym_name == 'fprintf':
-                            entry['llvm_type'] = 'i32 (i8*, i8*, ...)'
-                        elif sym_name == 'exit':
-                            entry['llvm_type'] = 'void (i32)'
-                        else:
-                            entry.setdefault('llvm_type', 'void (...)')
+                        entry.setdefault('llvm_type', 'void (...)')
 
     def _process_code_symbols(self):
         """Ensures all function labels and local code labels are in the symbol table with types."""
