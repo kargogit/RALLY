@@ -9,16 +9,13 @@ distinctions and scalar FP types. Finalizes dual signatures:
 Includes noreturn propagation + CFG pruning of fall-through edges.
 Inputs/Outputs: Enriched AST (JSON via stdin → Protobuf via stdout/file).
 """
-
 import sys
 import json
 from typing import Dict, List, Set, Optional, Any
 from collections import defaultdict
-
 from google.protobuf import text_format
 from google.protobuf.json_format import ParseDict, MessageToJson
 import ast_pb2 as pb
-
 from astNodes import (
     legacy_program_dict_to_ast,
     ast_to_legacy_section_dict,
@@ -28,7 +25,6 @@ from astNodes import (
     Instruction,
     LiftedFunctionSignature
 )
-
 # ---------------------------------------------------------------------------
 # Protobuf Serialization Helpers
 # ---------------------------------------------------------------------------
@@ -41,7 +37,6 @@ def normalize_section(sec_dict):
             if 'dgroup' in child and isinstance(child['dgroup'], list):
                 child['dgroup'] = {'items': child['dgroup']}
     return sec_dict
-
 def ast_to_proto(ast_obj: Program, original_dict: dict) -> pb.Program:
     """Serializes the optimized AST directly into a Protobuf message."""
     normalized = {
@@ -56,7 +51,6 @@ def ast_to_proto(ast_obj: Program, original_dict: dict) -> pb.Program:
     proto = pb.Program()
     ParseDict(normalized, proto, ignore_unknown_fields=True)
     return proto
-
 # ---------------------------------------------------------------------------
 # Type System (improved for FP, ptr retention, void)
 # ---------------------------------------------------------------------------
@@ -66,11 +60,9 @@ class TypeRef:
         self.is_float = is_float
         self.is_ptr = is_ptr
         self.signed = signed
-
     @staticmethod
     def unknown() -> 'TypeRef':
         return TypeRef(0, False, False, None)
-
     @staticmethod
     def from_string(s: Optional[str]) -> 'TypeRef':
         if not s or s == 'unknown':
@@ -83,7 +75,7 @@ class TypeRef:
             return TypeRef(32, True, False, None)
         if s in ('f64', 'double'):
             return TypeRef(64, True, False, None)
-        
+
         signed = None
         base = s
         if s.endswith('_signed'):
@@ -92,55 +84,50 @@ class TypeRef:
         elif s.endswith('_unsigned'):
             signed = False
             base = s[:-9]
-            
+
         if base.startswith('i') and base[1:].isdigit():
             return TypeRef(int(base[1:]), False, False, signed)
         return TypeRef.unknown()
-
     def to_string(self) -> str:
         if self.is_ptr:
             return 'ptr'
         if self.is_float:
             return 'float' if self.width == 32 else 'double'
-        
+
         suffix = ''
         if self.signed is True:
             suffix = '_signed'
         elif self.signed is False:
             suffix = '_unsigned'
-            
-        return f"i{self.width}{suffix}" if self.width > 0 else 'unknown'
 
+        return f"i{self.width}{suffix}" if self.width > 0 else 'unknown'
     def is_unknown(self) -> bool:
         return self.width == 0 and not self.is_ptr and not self.is_float and self.signed is None
-
 def meet(t1: Optional[TypeRef], t2: Optional[TypeRef]) -> TypeRef:
     """Lattice LUB (widen on conflict). Retains ptr on i64 conflict per spec."""
     if t1 is None or t1.is_unknown():
         return t2 or TypeRef.unknown()
     if t2 is None or t2.is_unknown():
         return t1
-        
+
     if t1.is_ptr and t2.is_ptr:
         return TypeRef(64, False, True, None)
     if t1.is_ptr != t2.is_ptr:
         return TypeRef(64, False, True, None) # conservative ptr semantics
-        
+
     if t1.is_float and t2.is_float:
         return t1 if t1.width == t2.width else TypeRef.unknown()
     if t1.is_float != t2.is_float:
         return TypeRef.unknown()
-        
+
     new_width = max(t1.width or 64, t2.width or 64)
     new_signed = t1.signed if t1.signed == t2.signed else None
     return TypeRef(new_width, False, False, new_signed)
-
 # ---------------------------------------------------------------------------
 # ABI / External helpers
 # ---------------------------------------------------------------------------
 INT_ARGS = ['RDI', 'RSI', 'RDX', 'RCX', 'R8', 'R9']
 XMM_ARGS = [f'XMM{i}' for i in range(8)]
-
 def get_canonical_reg(reg: str) -> Optional[str]:
     if not reg:
         return None
@@ -157,7 +144,6 @@ def get_canonical_reg(reg: str) -> Optional[str]:
         'RSP': 'RSP', 'RBP': 'RBP'
     }
     return map_rules.get(r) or (r if r.startswith('XMM') else None)
-
 class ExternalABIDB:
     KNOWN = {
         'printf': {'ret': TypeRef(32, False, False, True), 'args': [TypeRef(0, False, True, None)]},
@@ -170,18 +156,15 @@ class ExternalABIDB:
         'abort': {'ret': None, 'args': [], 'noreturn': True},
         'sqrt': {'ret': TypeRef(64, True, False, None), 'args': [TypeRef(64, True, False, None)]},
     }
-
     @staticmethod
     def get(name: str) -> Optional[Dict]:
         return ExternalABIDB.KNOWN.get(name)
-
 class CallSite:
     def __init__(self, caller: Function, instr: Instruction, target_name: str, is_external: bool):
         self.caller = caller
         self.instr = instr
         self.target_name = target_name
         self.is_external = is_external
-
 class InterproceduralAnalyzer:
     def __init__(self, program: Program):
         self.program = program
@@ -192,7 +175,6 @@ class InterproceduralAnalyzer:
             lambda: {'ret': TypeRef.unknown(), 'args': [TypeRef.unknown() for _ in range(6)]}
         )
         self._collect_functions()
-
     def _collect_functions(self):
         for sec in self.program.sections:
             for child in sec.children:
@@ -210,7 +192,6 @@ class InterproceduralAnalyzer:
                             except ValueError:
                                 pass
                     self.func_constraints[child.id]['args'] = arg_constraints
-
                     # Respect explicit 'void' from Step 7 ABI recovery
                     # (critical for bare-RET ELF ctors/dtors and other void funcs).
                     # Prevents default-to-i64 heuristic when there is zero evidence
@@ -221,7 +202,6 @@ class InterproceduralAnalyzer:
                     else:
                         rt = TypeRef.from_string(child.return_type)
                         self.func_constraints[child.id]['ret'] = rt if not rt.is_unknown() else TypeRef(64, False, False, None)
-
     def build_call_graph(self):
         for func in self.functions.values():
             for bb in func.basic_blocks:
@@ -234,7 +214,6 @@ class InterproceduralAnalyzer:
                             cs = CallSite(func, instr, name, is_ext)
                             self.call_graph.append(cs)
                             self.reverse_call_graph[name].append(cs)
-
     def _find_type_passed_at_call(self, cs: CallSite, arg_idx: int) -> TypeRef:
         if arg_idx < len(INT_ARGS):
             target_reg = INT_ARGS[arg_idx]
@@ -242,16 +221,14 @@ class InterproceduralAnalyzer:
             target_reg = XMM_ARGS[arg_idx]
         else:
             return TypeRef.unknown()
-
         bb = cs.instr.parent
         if not bb:
             return TypeRef.unknown()
-            
+
         try:
             call_idx = bb.instructions.index(cs.instr)
         except ValueError:
             return TypeRef.unknown()
-
         for i in range(call_idx - 1, -1, -1):
             prev = bb.instructions[i]
             if prev.operands and prev.operands[0].register:
@@ -259,22 +236,17 @@ class InterproceduralAnalyzer:
                     if prev.op_refinement:
                         t = TypeRef.from_string(prev.op_refinement)
                         return t if not (target_reg.startswith('XMM') and not t.is_float) else TypeRef(64, True, False, None)
-                        
-        if arg_idx < len(cs.caller.arguments):
-            return TypeRef.from_string(cs.caller.arguments[arg_idx].inferred_type)
-            
-        return TypeRef.unknown()
 
+        return TypeRef.unknown()
     def _find_return_usage_at_call(self, cs: CallSite) -> TypeRef:
         bb = cs.instr.parent
         if not bb:
             return TypeRef.unknown()
-            
+
         try:
             call_idx = bb.instructions.index(cs.instr)
         except ValueError:
             return TypeRef.unknown()
-
         for i in range(call_idx + 1, len(bb.instructions)):
             nxt = bb.instructions[i]
             for op in nxt.operands:
@@ -284,22 +256,20 @@ class InterproceduralAnalyzer:
                         if nxt.op_refinement:
                             t = TypeRef.from_string(nxt.op_refinement)
                             return t if not op.register.upper().startswith('XMM') else (t if t.is_float else TypeRef(64, True, False, None))
-                            
+
             if nxt.opcode.upper() in ('RET', 'JMP', 'CALL'):
                 break
-                
-        return TypeRef.unknown()
 
+        return TypeRef.unknown()
     def _prune_noreturn_fallthrough(self):
         """Prune spurious fall-through after calls to (newly) noreturn functions."""
         noreturn_targets = {name for name, info in ExternalABIDB.KNOWN.items() if info.get('noreturn')}
-        
+
         for f in self.functions.values():
             if (f.noreturn_kind == 'noreturn' or
                 (f.lifted_signature and 'noreturn' in f.lifted_signature.attributes)):
                 if f.entry_label:
                     noreturn_targets.add(f.entry_label)
-
         for cs in self.call_graph:
             if cs.target_name in noreturn_targets:
                 bb = cs.instr.parent
@@ -309,56 +279,52 @@ class InterproceduralAnalyzer:
                     for succ in old:
                         if bb in getattr(succ, 'predecessors', []):
                             succ.predecessors.remove(bb)
-
     def run(self):
         self.build_call_graph()
         worklist = set(self.functions.keys())
         iteration = 0
-        
+
         while worklist and iteration < 30: # safe bound
             iteration += 1
             next_worklist = set()
-            
+
             for f_id in list(worklist):
                 func = self.functions[f_id]
                 changed = False
                 callers = self.reverse_call_graph.get(func.entry_label, []) or self.reverse_call_graph.get(f_id, [])
                 ext_sig = ExternalABIDB.get(func.entry_label)
-
                 # Arg constraints (caller → callee)
                 new_args = list(self.func_constraints[f_id]['args'])
                 for cs in callers:
                     for i in range(6):
                         passed = self._find_type_passed_at_call(cs, i)
                         new_args[i] = meet(new_args[i], passed)
-                        
+
                 if ext_sig and 'args' in ext_sig:
                     for i, at in enumerate(ext_sig['args']):
                         if i < len(new_args):
                             new_args[i] = meet(new_args[i], at)
-                            
+
                 if new_args != self.func_constraints[f_id]['args']:
                     self.func_constraints[f_id]['args'] = new_args
                     changed = True
-
                 # Return constraints (callee → caller + external)
                 new_ret = self.func_constraints[f_id]['ret']
                 for cs in callers:
                     usage = self._find_return_usage_at_call(cs)
                     new_ret = meet(new_ret, usage)
-                    
+
                 if ext_sig:
                     if ext_sig.get('noreturn'):
                         new_ret = TypeRef.unknown()
                     elif ext_sig.get('ret'):
                         new_ret = meet(new_ret, ext_sig['ret'])
-                        
+
                 new_ret = meet(new_ret, TypeRef.from_string(func.return_type))
-                
+
                 if new_ret != self.func_constraints[f_id]['ret']:
                     self.func_constraints[f_id]['ret'] = new_ret
                     changed = True
-
                 if changed:
                     next_worklist.add(f_id)
                     for cs in callers:
@@ -367,13 +333,11 @@ class InterproceduralAnalyzer:
                     for cs_out in self.call_graph:
                         if cs_out.caller.id == f_id and cs_out.target_name in self.functions:
                             next_worklist.add(cs_out.target_name)
-                            
+
             worklist = next_worklist
-
-        self._prune_noreturn_fallthrough()
         self._finalize_signatures()
-        self._propagate_refinements() # global op_refinement / arg / return consistency
-
+        self._propagate_refinements()
+        self._prune_noreturn_fallthrough()
     def _refine_external_abi_signature(self, func: Function, refined_ret: str) -> str:
         """Merge interprocedural results into Step 7 external sig while preserving structure."""
         existing = func.external_abi_signature
@@ -381,7 +345,6 @@ class InterproceduralAnalyzer:
             return f"{refined_ret} ()"
         _, rest = existing.split(' (', 1)
         return f"{refined_ret} ({rest}"
-
     def _propagate_refinements(self):
         """Minimal practical propagation to AST (args, return_type, op_refinement seeds)."""
         for f_id, cons in self.func_constraints.items():
@@ -394,7 +357,6 @@ class InterproceduralAnalyzer:
             rt = cons['ret']
             if not rt.is_unknown() and func.return_type != 'void':
                 func.return_type = rt.to_string()
-
     def _finalize_signatures(self):
         """Finalize dual signatures.
         - lifted_signature: internal LLVM view (void + noreturn attribute when applicable).
@@ -406,7 +368,6 @@ class InterproceduralAnalyzer:
             ext_sig = ExternalABIDB.get(func.entry_label)
             is_noreturn = (func.noreturn_kind == 'noreturn' or
                            (ext_sig and ext_sig.get('noreturn')))
-
             ret_t = cons['ret']
             # Base return type from interprocedural refinement + original Step-7 ABI seed
             base_ret = (ret_t.to_string() if not ret_t.is_unknown()
@@ -415,13 +376,11 @@ class InterproceduralAnalyzer:
                 base_ret = base_ret.rsplit('_', 1)[0]
             if base_ret == 'ptr':
                 base_ret = 'i8*'
-
             # Lifted (internal) signature – noreturn becomes void + attribute
             lifted_ret_type_str = 'void' if is_noreturn else base_ret
             attributes = ['noreturn'] if is_noreturn else []
             func.lifted_signature = LiftedFunctionSignature(
                 return_type=lifted_ret_type_str, attributes=attributes)
-
             # External ABI signature (boundary only)
             # MUST keep the original ABI return type (e.g. i32 for main)
             if func.is_boundary:
@@ -432,16 +391,15 @@ class InterproceduralAnalyzer:
                     abi_ret_type_str = base_ret
                 func.external_abi_signature = self._refine_external_abi_signature(
                     func, abi_ret_type_str)
-
 def main():
     args = sys.argv[1:]
-    
+
     # Handle optional --print flag
     print_proto = False
     if "--print" in args:
         print_proto = True
         args.remove("--print")
-        
+
     try:
         raw = sys.stdin.read()
         if not raw.strip():
@@ -451,22 +409,22 @@ def main():
     except Exception as e:
         sys.stderr.write(f"JSON error: {e}\n")
         sys.exit(3)
-        
+
     try:
         # 1. Deserialize via AST nodes
         program = legacy_program_dict_to_ast(obj, include_enhancements=True)
-        
+
         # 2. Perform step 9 refinements directly on the AST
         analyzer = InterproceduralAnalyzer(program)
         analyzer.run()
-        
+
         # 3. Serialize output directly to Protobuf
         proto_msg = ast_to_proto(program, obj)
-        
+
         # Dump human readable format to standard out if requested
         if print_proto:
             print(MessageToJson(proto_msg, indent=2))
-            
+
         # Determine output location (file or stdout)
         out_path = args[0] if len(args) > 0 else None
         if out_path:
@@ -477,12 +435,11 @@ def main():
             # Output directly to stdout buffer to continue the pipeline cleanly (skipping text serialization)
             if not print_proto:
                 sys.stdout.buffer.write(proto_msg.SerializeToString(deterministic=True))
-                
+
     except Exception as e:
         sys.stderr.write(f"Step 9 error: {repr(e)}\n")
         import traceback
         traceback.print_exc(file=sys.stderr)
         sys.exit(1)
-
 if __name__ == "__main__":
     main()
