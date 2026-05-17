@@ -24,7 +24,6 @@ from astNodes import (
 )
 
 # ---- Constants -----------------------------------------------------------
-# Known external noreturn functions
 EXTERNAL_NORETURN_FUNCS = {
     'exit', '_exit', 'abort', '__stack_chk_fail',
     '_Exit', 'quick_exit', 'pthread_exit'
@@ -41,7 +40,6 @@ def is_jmp_opcode(opcode: str) -> bool:
 
 # ---- Helper Functions ----------------------------------------------------
 def is_unresolved_indirect_terminator(instr: Instruction) -> bool:
-    """Return True if the instruction is an unresolved indirect control-transfer terminator."""
     if instr is None or is_return_opcode(instr.opcode):
         return False
     if len(instr.target_blocks) > 0 or len(instr.indirect_targets) > 0:
@@ -52,34 +50,27 @@ def is_unresolved_indirect_terminator(instr: Instruction) -> bool:
     return True
 
 def has_unresolved_indirect_terminators(func: Function) -> bool:
-    """Return True if the function contains any unresolved indirect terminator."""
     for bb in func.basic_blocks:
         if bb.terminator and is_unresolved_indirect_terminator(bb.terminator):
             return True
     return False
 
 def get_function_containing_bb(bb: BasicBlock, program: Program) -> Optional[Function]:
-    """Finds the parent Function of a BasicBlock."""
-    # Check parent reference first if populated by Step 4
     if bb.parent and isinstance(bb.parent, Function):
         return bb.parent
 
-    # Fallback search
+    bb_id = bb.id
     for sec in program.sections:
         for child in sec.children:
             if isinstance(child, Function):
-                if bb in child.basic_blocks:
+                # --- FIX: compare by .id, not by __eq__ ---
+                if any(b.id == bb_id for b in child.basic_blocks):
                     return child
     return None
 
 def get_call_target_name(instr: Instruction) -> Optional[str]:
-    """
-    Extracts the target function name from a CALL instruction's operands.
-    Checks 'name' field or 'symbol_ref'.
-    """
     if not instr.operands:
         return None
-    # Assuming the first operand of CALL is the target
     op = instr.operands[0]
     if op.name:
         return op.name
@@ -88,53 +79,37 @@ def get_call_target_name(instr: Instruction) -> Optional[str]:
     return None
 
 def classify_call_target(instr: Instruction, func_map: Dict[str, Function]) -> Optional[str]:
-    """
-    Classify a CALL instruction target as:
-    - 'internal': Direct call to a function defined within the program (target_blocks populated)
-    - 'external': Direct call to an external symbol (e.g., PLT call to printf/exit)
-    - 'indirect': Indirect call via register or memory (function pointer)
-    - None: Not a call instruction
-    """
     if not is_call_opcode(instr.opcode):
         return None
-    # Check for internal direct call (target_blocks points to entry BB of internal function)
     if instr.target_blocks:
         return "internal"
-    # Check for external direct call (has symbol name but no target_blocks)
     if get_call_target_name(instr) is not None:
         return "external"
-    # Otherwise, it's an indirect call (e.g., call rax, call [mem])
     return "indirect"
 
-def resolve_target_function(instr: Instruction, func_map: Dict[str, Function]) -> Optional[Function]:
+def resolve_target_function_via_map(
+    instr: Instruction,
+    bb_id_to_func: Dict[str, Function],
+) -> Optional[Function]:
     """
-    Resolves the target Function object for a CALL instruction if it is internal
-    and direct (i.e., target_blocks is populated).
+    Resolves the target Function for a CALL/JMP using a prebuilt
+    bb_id → Function lookup.  Avoids __eq__ on BasicBlock entirely.
     """
     if not instr.target_blocks:
         return None
-
-    # target_blocks contains BasicBlocks. The entry block of a function is the target.
     target_bb = instr.target_blocks[0]
     if not target_bb:
         return None
+    return bb_id_to_func.get(target_bb.id)
 
-    # Find the function containing this target basic block
-    for func in func_map.values():
-        if target_bb in func.basic_blocks:
-            return func
-    return None
-
-def is_noreturn_callee_target(instr: Instruction, noreturn_status: Dict[str, bool], func_map: Dict[str, Function]) -> bool:
-    """
-    Return True if the instruction is a CALL that targets a known noreturn
-    function (internal or external). Used for both noreturn inference and
-    call-site metadata. Follows the exact resolution logic from the original
-    implementation for minimal disruption.
-    """
+def is_noreturn_callee_target(
+    instr: Instruction,
+    noreturn_status: Dict[str, bool],
+    bb_id_to_func: Dict[str, Function],
+) -> bool:
     if not is_call_opcode(instr.opcode):
         return False
-    target_func = resolve_target_function(instr, func_map)
+    target_func = resolve_target_function_via_map(instr, bb_id_to_func)
     if target_func:
         return noreturn_status.get(target_func.id, False)
     name = get_call_target_name(instr)
@@ -144,12 +119,11 @@ def is_noreturn_callee_target(instr: Instruction, noreturn_status: Dict[str, boo
 
 # ---- Core Analysis Logic -------------------------------------------------
 def analyze_noreturn_behavior(program: Program):
-    """
-    Detects noreturn functions and updates CFG edges.
-    """
     # 1. Build mappings
     func_map: Dict[str, Function] = {}
-    bb_map: Dict[str, BasicBlock] = {} # bb_id -> bb
+    bb_map: Dict[str, BasicBlock] = {}
+    # --- FIX: bb_id → owning Function (avoids __eq__ scan) ---
+    bb_id_to_func: Dict[str, Function] = {}
 
     for sec in program.sections:
         for child in sec.children:
@@ -157,55 +131,46 @@ def analyze_noreturn_behavior(program: Program):
                 func_map[child.id] = child
                 for bb in child.basic_blocks:
                     bb_map[bb.id] = bb
+                    bb_id_to_func[bb.id] = child
+
     # Annotate call target classifications
-    # This must happen before any analysis that depends on it
     for func in func_map.values():
         for bb in func.basic_blocks:
             for instr in bb.instructions:
                 instr.call_target_kind = classify_call_target(instr, func_map)
-    # Detect functions with unresolved indirect terminators (defer their analysis/pruning)
+
+    # Detect functions with unresolved indirect terminators
     deferred_funcs: Set[str] = set()
     for fid, func in func_map.items():
         if has_unresolved_indirect_terminators(func):
             deferred_funcs.add(fid)
-    # 2. Initialize Noreturn Status
-    # status: func_id (or external name) -> bool (True if noreturn)
-    noreturn_status: Dict[str, bool] = {}
 
-    # Initialize external known noreturns
+    # 2. Initialize Noreturn Status
+    noreturn_status: Dict[str, bool] = {}
     for ext_name in EXTERNAL_NORETURN_FUNCS:
         noreturn_status[ext_name] = True
-
-    # Initialize internal functions conservatively (False = returns)
     for func_id in func_map:
         noreturn_status[func_id] = False
-    # 3. Worklist Algorithm for Noreturn Detection
-    worklist: Deque[str] = deque(fid for fid in func_map.keys() if fid not in deferred_funcs)
 
-    # Cache of function entry block IDs
+    # 3. Worklist Algorithm for Noreturn Detection
+    worklist: Deque[str] = deque(
+        fid for fid in func_map.keys() if fid not in deferred_funcs
+    )
     func_entry_bb_id: Dict[str, str] = {}
     for fid, func in func_map.items():
         if func.basic_blocks:
             func_entry_bb_id[fid] = func.basic_blocks[0].id
+
     while worklist:
         fid = worklist.popleft()
         func = func_map[fid]
-
-        # Check if function is noreturn
-        # A function is noreturn if no RET instruction is reachable from entry
-        # under current noreturn-callee understanding (using existing CFG).
-
         is_currently_noreturn = noreturn_status[fid]
 
-        # Reachability analysis (BFS) – strictly uses the attached CFG successors
-        # while respecting noreturn call / tail-jump semantics.
         visited: Set[str] = set()
         queue: Deque[str] = deque()
-
         entry_id = func_entry_bb_id.get(fid)
         if not entry_id:
-            continue # Empty function
-
+            continue
         queue.append(entry_id)
         visited.add(entry_id)
 
@@ -214,7 +179,8 @@ def analyze_noreturn_behavior(program: Program):
         while queue:
             bb_id = queue.popleft()
             bb = bb_map.get(bb_id)
-            if not bb: continue
+            if not bb:
+                continue
 
             term = bb.terminator
             term_terminates_path = False
@@ -227,44 +193,32 @@ def analyze_noreturn_behavior(program: Program):
                     break
 
                 elif is_call_opcode(opc):
-                    # Use helper (exact same resolution logic as original)
-                    if is_noreturn_callee_target(term, noreturn_status, func_map):
+                    # --- FIX: pass bb_id_to_func instead of func_map ---
+                    if is_noreturn_callee_target(term, noreturn_status, bb_id_to_func):
                         term_terminates_path = True
 
                 elif is_jmp_opcode(opc):
-                    # Check for tail call (jmp to function entry)
-                    target_func = resolve_target_function(term, func_map)
+                    target_func = resolve_target_function_via_map(term, bb_id_to_func)
                     if target_func:
                         if not noreturn_status.get(target_func.id, False):
-                            # Tail to a returning function → this function returns
                             found_ret = True
                             break
                         else:
-                            # Tail to a noreturn function → this path ends (no ret)
                             term_terminates_path = True
 
-            # Add explicit successors ONLY if this path continues.
-            # This is the conservative CFG-based reachability required by the spec:
-            # noreturn calls and noreturn tails are treated as sinks.
-            # (The original manual fall-through logic using basic_blocks list order
-            # has been removed – it was brittle and is no longer needed because
-            # the existing CFG successors already encode the conservative fall-through.)
             if not term_terminates_path:
                 for succ in bb.successors:
                     if succ.id not in visited:
                         visited.add(succ.id)
                         queue.append(succ.id)
 
-        # Update status if changed
         is_definitely_noreturn = not found_ret
         if is_definitely_noreturn != is_currently_noreturn:
             noreturn_status[fid] = is_definitely_noreturn
-            # Re-queue all functions that call this one (interprocedural propagation)
-            # Since we don't have a full call graph, we just re-queue everyone
-            # or scan. Re-queueing everyone is safer and reasonably fast for small/med programs.
             for other_fid in func_map:
                 if other_fid != fid and other_fid not in deferred_funcs:
                     worklist.append(other_fid)
+
     # 4. Annotate Functions
     for fid, func in func_map.items():
         if fid in deferred_funcs:
@@ -272,46 +226,42 @@ def analyze_noreturn_behavior(program: Program):
         elif noreturn_status.get(fid, False):
             func.noreturn_kind = "noreturn"
         else:
-            func.noreturn_kind = None # Explicitly clear if needed
+            func.noreturn_kind = None
 
-    # 4b. Annotate call sites (for all functions – even deferred ones)
-    # This fulfills the spec requirement for per-call-site "whether a call site
-    # is known to target a non-returning callee" while remaining robust to
-    # incomplete information.
+    # 4b. Annotate call sites
     for func in func_map.values():
         for bb in func.basic_blocks:
             for instr in bb.instructions:
                 if is_call_opcode(instr.opcode):
                     instr.is_noreturn_callee = is_noreturn_callee_target(
-                        instr, noreturn_status, func_map
+                        instr, noreturn_status, bb_id_to_func
                     )
 
     # 5. Prune Spurious Fall-Through Edges
     for func in func_map.values():
         if func.id in deferred_funcs:
-            continue # Skip pruning in deferred functions to retain conservative fall-through
+            continue
         bb_list = func.basic_blocks
         for i, bb in enumerate(bb_list):
             term = bb.terminator
             if term and is_call_opcode(term.opcode):
-                # Use the shared helper (removes duplicated resolution logic)
-                is_noreturn_call = is_noreturn_callee_target(term, noreturn_status, func_map)
-
+                is_noreturn_call = is_noreturn_callee_target(
+                    term, noreturn_status, bb_id_to_func
+                )
                 if is_noreturn_call:
-                    # Identify fall-through block (next in list – matches original
-                    # Step-4 construction of sequential basic_blocks with conservative
-                    # fall-through edges).
                     if i + 1 < len(bb_list):
                         fallthrough_bb = bb_list[i + 1]
+                        ft_id = fallthrough_bb.id
+                        bb_id = bb.id
 
-                        # Remove from successors
-                        # We must be careful to compare by ID or object identity to avoid "TypeError: unhashable type"
-                        if fallthrough_bb in bb.successors:
-                            bb.successors.remove(fallthrough_bb)
-
-                        # Remove from predecessors
-                        if bb in fallthrough_bb.predecessors:
-                            fallthrough_bb.predecessors.remove(bb)
+                        # --- FIX: filter by .id to avoid __eq__ recursion ---
+                        bb.successors = [
+                            s for s in bb.successors if s.id != ft_id
+                        ]
+                        fallthrough_bb.predecessors = [
+                            p for p in fallthrough_bb.predecessors
+                            if p.id != bb_id
+                        ]
     return program
 
 # ---- CLI Entry Point -----------------------------------------------------
@@ -327,17 +277,13 @@ def main():
         sys.exit(3)
 
     try:
-        # Deserialize with enhancements enabled to get parent links etc.
         ast_prog: Program = legacy_program_dict_to_ast(obj, include_enhancements=True)
-
-        # Perform Step 5 Refinement
         refined_prog = analyze_noreturn_behavior(ast_prog)
-
-        # Serialize back
-        legacy_out = ast_to_legacy_program_dict(refined_prog, include_instr_locations=False, include_enhancements=True)
+        legacy_out = ast_to_legacy_program_dict(
+            refined_prog, include_instr_locations=False, include_enhancements=True
+        )
         json.dump(legacy_out, sys.stdout, indent=2, sort_keys=False)
         sys.stdout.write("\n")
-
     except Exception as exc:
         sys.stderr.write(f"Unexpected error in Step 5: {repr(exc)}\n")
         import traceback
