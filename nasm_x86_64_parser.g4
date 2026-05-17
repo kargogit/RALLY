@@ -567,29 +567,32 @@ instruction
 
 opcode
     : MOV | LEA
-    | PUSH | POP | LEAVE                    // Stack operations
-    | ADD | SUB | INC | DEC                 // Arithmetic
-    | MOVSS | ADDSS | MULSS                 // Floating-Point Arithmetic (SSE)
-    | CVTTSS2SI                             // Floating-Point to Integer Conversion (SSE)
-    | CMP | TEST | SETNE | SETC | SETPE     // Comparison
-    | CMOVE | CMOVNE                        // Conditional move (move if not-equal / ZF == 0)
-    | AND | OR | XOR                        // Logical
-    | SHL | SHR | SAR                       // Bit shifts
-    | CALL | JMP | RET                      // Control flow (if not in terminator_instruction)
-    | NOP                                   // No operation
-    | MOVSX | MOVZX | MOVSXD                // Sign/zero extend (essential for type conversions)
-    | IMUL | MUL                            // Multiplication
-    | IDIV | DIV                            // Division
-    | NEG                                   // Negation
-    | XCHG                                  // Exchange
-    | CDQ | CQO | CDQE                      // sign-extend instructions (CDQ: EAX->EDX:EAX; CQO: RAX->RDX:RAX; CDQE: EAX->RAX)
-    | LOOP | LOOPE | LOOPNE                 // Loop control
-    | SYSCALL                               // System calls (Linux/Unix PIC)
-    | NOT                                   // Bitwise NOT
-    | ROL | ROR                             // Rotate
-    | BT | BTS | BTR | BTC                  // Bit test and set
-    | LEA                                   // RIP-relative addressing
-    | UD2                                   // Undefined instruction (for deliberate faults)
+    | PUSH | POP | LEAVE                                            // Stack operations
+    | ADD | SUB | INC | DEC | XADD                                  // Arithmetic
+    | MOVSS | ADDSS | MULSS | DIVSS | SUBSS | MOVSD                 // Floating-Point Arithmetic (SSE)
+    | MOVAPS | MOVUPS | MOVDQA | MOVQ | MOVSQ | MOVSD               // SSE moves / packed
+    | CVTTSS2SI| CVTSI2SS | CVTSS2SD | CVTSD2SS                     // Floating-Point to Integer Conversion (SSE)
+    | COMISD | ANDPS | PXOR                                         // SSE compare / logic
+    | CMP | TEST                                                    // Comparison
+    | SETL | SETB | SETNLE | SETBE | SETLE | SETNBE | SETNZ | SETZ | SETNE | SETC | SETPE       // SETcc
+    | CMOVNS | CMOVNB | CMOVS | CMOVZ | CMOVNL | CMOVLE | CMOVNZ | CMOVNLE | CMOVE | CMOVNE     // CMOVcc
+    | AND | OR | XOR | NOT                                          // Logical / Bitwise
+    | SHL | SHR | SAR                                               // Bit shifts
+    | CALL | JMP | RET                                              // Control flow (if not in terminator_instruction)
+    | NOP                                                           // No operation
+    | MOVSX | MOVZX | MOVSXD                                        // Sign/zero extend (essential for type conversions)
+    | IMUL | MUL                                                    // Multiplication
+    | IDIV | DIV                                                    // Division
+    | NEG                                                           // Negation
+    | XCHG                                                          // Exchange
+    | CDQ | CQO | CDQE| CWDE                                        // sign-extend instructions (CDQ: EAX->EDX:EAX; CQO: RAX->RDX:RAX; CDQE: EAX->RAX)
+    | LOOP | LOOPE | LOOPNE                                         // Loop control
+    | SYSCALL                                                       // System calls (Linux/Unix PIC)
+    | ROL | ROR                                                     // Rotate
+    | BT | BTS | BTR | BTC                                          // Bit test and set
+    | LEA                                                           // RIP-relative addressing
+    | UD2                                                           // Undefined instruction (for deliberate faults)
+    | BSF | BSR                                                     // Bit scan forward/reverse
     ;
 
 segment_register
